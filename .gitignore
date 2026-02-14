@@ -1,0 +1,12 @@
+/myenv
+myenv/
+/.venv
+.venv/
+/__pycache__
+__pycache__/
+*.env
+test.py
+*.idea
+*.zip
+/data
+data/
