@@ -4,6 +4,7 @@ myenv/
 .venv/
 /__pycache__
 __pycache__/
+/wandb
 *.env
 test.py
 *.idea

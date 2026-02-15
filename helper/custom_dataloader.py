@@ -35,13 +35,16 @@ class Variables:
     def __init__(self):
         self.mel = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.SAMPLE_RATE,
-            n_fft=2048,
-            hop_length=512,
-            n_mels=self.N_MELS
+            n_fft=1024,
+            hop_length=256,
+            n_mels=self.N_MELS,
+            f_min=20,
+            f_max=8000,
+            power=2.0
         )
 
         # dB=10⋅log10​(Power)
-        self.db = torchaudio.transforms.AmplitudeToDB()
+        self.db = torchaudio.transforms.AmplitudeToDB(top_db=80)
 
     def _fix_length(self, signal: torch.Tensor):
         length = signal.shape[1]
@@ -59,16 +62,23 @@ class Variables:
 
 
 class ESC50_DataLoader(Dataset):
-    def __init__(self, esc50_dir: Path):
+    def __init__(self, esc50_dir: Path, allowed_folds=None):
         self.esc50_dir = esc50_dir
         self.audio_dir = esc50_dir / "audio"
         self.variables = Variables()
 
         self.meta_data = None
+        self.allowed_folds = allowed_folds
 
     def load_meta_data(self, meta_data_path: str):
         print(f"Loading metadata from file: {meta_data_path}")
-        self.meta_data = pd.read_csv(meta_data_path)
+        df = pd.read_csv(meta_data_path)
+
+        # filter folds
+        if self.allowed_folds is not None:
+            df = df[df["fold"].isin(self.allowed_folds)].reset_index(drop=True)
+
+        self.meta_data = df
     
     
     def __len__(self):
@@ -83,13 +93,7 @@ class ESC50_DataLoader(Dataset):
 
         file_path = self.audio_dir / filename
 
-        num_frames = self.variables.SAMPLES 
-
-        waveform, sr = torchaudio.load(
-            file_path,
-            frame_offset=0,
-            num_frames=num_frames
-        )
+        waveform, sr = torchaudio.load(file_path)
 
         # mono as esc50 is has mono channel
         waveform = torch.mean(waveform, dim=0, keepdim=True)
@@ -105,7 +109,11 @@ class ESC50_DataLoader(Dataset):
         mel = self.variables.mel(waveform)
         mel = self.variables.db(mel)
 
-        mel = (mel - mel.mean()) / (mel.std() + 1e-6)
+        # Convert [-80, 0] dB → [0, 1]
+        mel = (mel + 80) / 80
+
+        # clamp for safety
+        mel = torch.clamp(mel, 0, 1)
 
         return mel, torch.tensor(label, dtype=torch.long)
 
@@ -190,6 +198,7 @@ class GenreDataLoader(Dataset):
         mel = self.variables.mel(final_waveform)
         mel = self.variables.db(mel)
 
-        mel = (mel - mel.mean()) / (mel.std() + 1e-6)
+        mel = (mel + 80) / 80
+        mel = torch.clamp(mel, 0, 1)
 
         return mel, torch.tensor(label, dtype=torch.long)
