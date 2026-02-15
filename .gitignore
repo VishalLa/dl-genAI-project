@@ -5,6 +5,7 @@ myenv/
 /__pycache__
 __pycache__/
 /wandb
+wandb/
 *.env
 test.py
 *.idea
