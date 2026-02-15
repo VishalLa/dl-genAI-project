@@ -12,3 +12,4 @@ test.py
 *.zip
 /data
 data/
+*.pth
