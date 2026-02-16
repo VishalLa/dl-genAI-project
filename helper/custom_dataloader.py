@@ -310,17 +310,6 @@ class GenreDataLoader_Waveform_Chunked(Dataset):
     def __len__(self):
         return len(self.samples)
     
-    def _fix_length(self, signal: torch.Tensor, target_length: int):
-        length = signal.shape[1]
-
-        if length > target_length:
-            signal = signal[:, :target_length]
-        elif length < target_length:
-            padding = target_length - length
-            signal = torch.nn.functional.pad(signal, (0, padding))
-
-        return signal
-    
     def _fix_length(self, signal: torch.Tensor) -> torch.Tensor:
         length = signal.shape[1]
 
@@ -356,7 +345,7 @@ class GenreDataLoader_Waveform_Chunked(Dataset):
 
         full_waveform = torch.cat(waveforms, dim=1)
 
-        total_samples = full_waveform = full_waveform[1]
+        total_samples = full_waveform.shape[1]
         num_chunks = total_samples // self.CHUNK_SAMPLES
 
         if num_chunks == 0:
@@ -371,7 +360,7 @@ class GenreDataLoader_Waveform_Chunked(Dataset):
                 start_idx = i * self.CHUNK_SAMPLES
                 end_idx = start_idx + self.CHUNK_SAMPLES
 
-                chunk = full_waveform[:, start_idx, end_idx]
+                chunk = full_waveform[:, start_idx: end_idx]
                 chunks.append(chunk)
             
             chunks = torch.stack(chunks, dim=0)

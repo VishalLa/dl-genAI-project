@@ -1,6 +1,7 @@
 import torch 
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
+from collections import Counter
 
 import numpy as np
 
@@ -82,7 +83,7 @@ def test_esc50(model, dataloader, loss_function, device):
 
 
 
-def train_esc50_model(model, esc50_dir, meta_csv, device, epochs=100, batch_size=64):
+def train_esc50_model(model, device, train_dataloader, test_dataloader, epochs=100):
     print(f"\n{'='*70}")
     print(f"ESC-50 TRAINING")
     print(f"{'='*70}\n")
@@ -106,26 +107,6 @@ def train_esc50_model(model, esc50_dir, meta_csv, device, epochs=100, batch_size
 
     # wandb.watch(model, log="all", log_freq=50)
 
-    print("1. Loading ESC-50 dataset...")
-    train_dataset = ESC50_DataLoader_Waveform(esc50_dir, allowed_folds=[1, 2, 3, 4])
-    train_dataset.load_meta_data(meta_csv)
-
-    test_dataset = ESC50_DataLoader_Waveform(esc50_dir, allowed_folds=[5])
-    test_dataset.load_meta_data(meta_csv)
-
-    # dataloader 
-    print("\n2. Creating dataloaders...")
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True
-    )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False
-    )
-
     print("\n3. Setting up training...")
     model = model.to(device)
     loss_function = nn.CrossEntropyLoss()
@@ -136,6 +117,9 @@ def train_esc50_model(model, esc50_dir, meta_csv, device, epochs=100, batch_size
         lr=0.001
     )
 
+    change_stage = epochs // 3
+
+    best_val_acc = 0
     for epoch in range(epochs):
         if epoch == 0:
             # STAGE 1: Only train final layer
@@ -153,7 +137,7 @@ def train_esc50_model(model, esc50_dir, meta_csv, device, epochs=100, batch_size
             print(f"         Trainable params: {trainable:,}")
             print(f"{'='*70}\n")
         
-        elif epoch == 20:
+        elif epoch == change_stage:
             # STAGE 2: Unfreeze last 2 conv blocks
             for name, param in model.named_parameters():
                 if 'conv_block5' in name or 'conv_block6' in name or 'fc' in name:
@@ -170,7 +154,7 @@ def train_esc50_model(model, esc50_dir, meta_csv, device, epochs=100, batch_size
             print(f"         Trainable params: {trainable:,}")
             print(f"{'='*70}\n")
         
-        elif epoch == 40:
+        elif epoch == change_stage * 2:
             # STAGE 3: Unfreeze all conv blocks
             for name, param in model.named_parameters():
                 if 'spectrogram' not in name and 'logmel' not in name:
@@ -189,7 +173,7 @@ def train_esc50_model(model, esc50_dir, meta_csv, device, epochs=100, batch_size
         
         train_loss, train_acc = train_esc50(
             model=model,
-            dataloader=train_loader,
+            dataloader=train_dataloader,
             loss_function=loss_function,
             optimizer=optimizer,
             device=device
@@ -197,7 +181,7 @@ def train_esc50_model(model, esc50_dir, meta_csv, device, epochs=100, batch_size
         
         val_loss, val_acc = test_esc50(
             model=model,
-            dataloader=test_loader,
+            dataloader=test_dataloader,
             loss_function=loss_function,
             device=device
         )
@@ -217,7 +201,7 @@ def train_esc50_model(model, esc50_dir, meta_csv, device, epochs=100, batch_size
         #     "lr": optimizer.param_groups[0]["lr"]
         # })
 
-        if val_acc > best_val_acc:
+        if val_acc >= best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), "best_esc50_model.pth")
             print(f"         ✓ Saved best model (val_acc: {val_acc:.2f}%)")
@@ -250,10 +234,6 @@ def train_genre(model, dataloader, loss_function, optimizer, device):
         
         chunks = chunks.to(device)
         labels = labels.to(device)
-
-        # Forward pass on ALL chunks at once
-        output_dict = model(chunks)
-        logits = output_dict["clipwise_output"]  # [total_chunks, num_genres]
 
         output_dict = model(chunks)
         logits = output_dict["clipwise_output"]  # [total_chunks, num_genres]
@@ -344,7 +324,7 @@ def test_genre(model, dataloader, loss_function, device):
     return loss, accuracy
 
 
-def train_genre_model(model, genre_dir, device, epochs=50, batch_size=32):
+def train_genre_model(model, device, train_dataloader, test_dataloader, epochs=50):
     print(f"\n{'='*70}")
     print(f"GENRE CLASSIFICATION TRAINING")
     print(f"{'='*70}\n")
@@ -368,41 +348,6 @@ def train_genre_model(model, genre_dir, device, epochs=50, batch_size=32):
 
     # wandb.watch(model, log="all", log_freq=50)
 
-    print("1. Loading genre dataset...")
-    full_dataset = GenreDataLoader_Waveform_Chunked(genre_dir)
-
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-
-    train_dataset, val_dataset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-
-    print(f"   Train songs: {len(train_dataset)}")
-    print(f"   Val songs:   {len(val_dataset)}")
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn_chunks,
-        num_workers=4
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn_chunks,
-        num_workers=4
-    )
-
-    print(f"   Train batches: {len(train_loader)}")
-    print(f"   Val batches:   {len(val_loader)}")
-    print(f"   Note: {batch_size} songs/batch × 6 chunks = ~{batch_size*6} chunks/batch")
-
     print("\n3. Setting up training...")
     model = model.to(device)
 
@@ -417,6 +362,8 @@ def train_genre_model(model, genre_dir, device, epochs=50, batch_size=32):
     
     print(f"\n4. Starting training for {epochs} epochs...")
     print(f"{'='*70}\n")
+
+    change_stage = epochs // 3
 
     for epoch in range(epochs):
         if epoch == 0:
@@ -435,7 +382,7 @@ def train_genre_model(model, genre_dir, device, epochs=50, batch_size=32):
             print(f"         Trainable params: {trainable:,}")
             print(f"{'='*70}\n")
         
-        elif epoch == 20:
+        elif epoch == change_stage:
             # STAGE 2: Unfreeze last 2 conv blocks
             for name, param in model.named_parameters():
                 if 'conv_block5' in name or 'conv_block6' in name or 'fc' in name:
@@ -452,7 +399,7 @@ def train_genre_model(model, genre_dir, device, epochs=50, batch_size=32):
             print(f"         Trainable params: {trainable:,}")
             print(f"{'='*70}\n")
         
-        elif epoch == 40:
+        elif epoch == change_stage * 2:
             # STAGE 3: Unfreeze all conv blocks
             for name, param in model.named_parameters():
                 if 'spectrogram' not in name and 'logmel' not in name:
@@ -471,7 +418,7 @@ def train_genre_model(model, genre_dir, device, epochs=50, batch_size=32):
 
         train_loss, train_acc = train_genre(
             model=model,
-            dataloader=train_loader,
+            dataloader=train_dataloader,
             loss_function=loss_function,
             optimizer=optimizer,
             device=device
@@ -479,7 +426,7 @@ def train_genre_model(model, genre_dir, device, epochs=50, batch_size=32):
         
         val_loss, val_acc = test_genre(
             model=model,
-            dataloader=val_loader,
+            dataloader=test_dataloader,
             loss_function=loss_function,
             device=device
         )
@@ -499,7 +446,7 @@ def train_genre_model(model, genre_dir, device, epochs=50, batch_size=32):
         #     "lr": optimizer.param_groups[0]["lr"]
         # })
         
-        if val_acc > best_val_acc:
+        if val_acc >= best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), "best_genre_model.pth")
             print(f"         ✓ Saved best model (val_acc: {val_acc:.2f}%)")
