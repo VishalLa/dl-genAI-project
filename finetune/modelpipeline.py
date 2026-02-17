@@ -8,7 +8,7 @@ from torch.utils.data import WeightedRandomSampler, DataLoader, random_split
 from finetune.utils import train_esc50_model, train_genre_model
 from finetune.cnn14 import Cnn14
 
-from helper.custom_dataloader import (
+from helper.DataLoaders.custom_dataloader import (
     GenreDataLoader_Waveform_Chunked,
     ESC50_DataLoader_Waveform,
     collate_fn_chunks

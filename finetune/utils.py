@@ -5,7 +5,7 @@ from collections import Counter
 
 import numpy as np
 
-from helper.custom_dataloader import ESC50_DataLoader_Waveform, GenreDataLoader_Waveform_Chunked, collate_fn_chunks
+from helper.DataLoaders.custom_dataloader import ESC50_DataLoader_Waveform, GenreDataLoader_Waveform_Chunked, collate_fn_chunks
 # import wandb
 
 
