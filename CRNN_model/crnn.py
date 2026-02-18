@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from CRNN_model.attention import AudioMultiHeadAttention
 
 
 """
@@ -12,8 +13,7 @@ https://github.com/GitYCC/crnn-pytorch/blob/master/src/model.py
 
 class CRNN(nn.Module):
     def __init__(
-            self, num_class: int, channel: int = 1, height: int = 128, width: int = 216,
-            linear_layer_out: int = 64, rnn_hidden: int = 128,
+            self, num_class: int, channel: int = 1, height: int = 128, width: int = 216, linear_layer_out: int = 64, rnn_hidden: int = 128,
         ):
         super(CRNN, self).__init__()
 
@@ -28,6 +28,13 @@ class CRNN(nn.Module):
         )
 
         self.lstm = nn.LSTM(linear_layer_out, rnn_hidden, bidirectional=True)
+        self.lstm_dropout = nn.Dropout(0.3)
+
+        self.attention = AudioMultiHeadAttention(
+            n_embeddings=rnn_hidden*2,
+            n_heads=4,
+            head_size=rnn_hidden // 2,
+        )
 
         self.head = nn.Linear(
             in_features=2 * rnn_hidden,
@@ -89,7 +96,7 @@ class CRNN(nn.Module):
         print(f"  Total     : {total:,}")
         print(f"  Trainable : {trainable:,}")
         print(f"  Frozen    : {frozen:,}")
-        
+
 
     def forward(self, x: torch.Tensor):
         conv = self.cnn(x)                                
@@ -101,8 +108,12 @@ class CRNN(nn.Module):
         seq = self.conv_to_fc(conv)
 
         recurrent, _ = self.lstm(seq)
-        
-        # mean over timestep
-        output = self.head(recurrent.mean(0))
+        recurrent = self.lstm_dropout(recurrent)
 
-        return output
+        recurrent = recurrent.permute(1, 0, 2)
+
+        context   = self.attention(recurrent)
+        context   = context.mean(dim=1)
+
+        return self.head(context)
+            
