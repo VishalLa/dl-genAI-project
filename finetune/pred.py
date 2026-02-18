@@ -1,9 +1,5 @@
 import torch
-import pandas as pd
-from torch.utils.data import Dataset
 import torchaudio
-from pathlib import Path
-from helper.golbal_variables import * 
 
 
 def predict(model, audio_path, device, genre_map):

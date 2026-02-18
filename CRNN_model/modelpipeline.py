@@ -30,7 +30,7 @@ class ModelPipeline:
     
     def get_esc50_dataloader(self):
         print("Loading ESC-50 dataset...")
-        train_dataset = ESC50_DataLoader(esc50_dir=self.esc50_dir, allowed_folds=[1, 2, 3, 4])
+        train_dataset = ESC50_DataLoader(esc50_dir=self.esc50_dir, allowed_folds=[1, 2, 3, 4], augment=True)
         train_dataset.load_meta_data(self.esc50_dir / "meta" / "esc50.csv")
         test_dataset = ESC50_DataLoader(esc50_dir=self.esc50_dir, allowed_folds=[5])
         test_dataset.load_meta_data(self.esc50_dir / "meta" / "esc50.csv")
@@ -55,9 +55,9 @@ class ModelPipeline:
 
     def get_genre_dataloader(self):
         print("Loading genre dataset...")
-        genre_dataset = GenreDataLoader(root_dir=self.genre_dir)
+        genre_dataset = GenreDataLoader(root_dir=self.genre_dir, augment=True)
 
-        train_size = int(0.9 * len(genre_dataset))
+        train_size = int(0.8 * len(genre_dataset))
         val_size = len(genre_dataset) - train_size
         train_dataset, val_dataset = random_split(
             genre_dataset,

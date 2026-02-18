@@ -65,7 +65,7 @@ class Variables:
         return signal
     
 
-    def highpass_filter(self, audio: torch.Tensor, cutoff: int = 80) -> torch.Tensor:
+    def highpass_filter(self, audio: torch.Tensor, cutoff: int = 40) -> torch.Tensor:
         b, a = butter(5, cutoff / (self.SAMPLE_RATE / 2), btype='high')
         
         audio_np = audio.numpy()
@@ -79,27 +79,35 @@ class Variables:
         return clean_audio
     
 
-    # def _augment(self, waveform, sample_rate):
-    #     shift = int(np.random.uniform(-0.2, 0.2) * waveform.shape[-1])
-    #     waveform = torch.roll(waveform, shift, dims=-1)
-
-    #     # Add Gaussian noise (low intensity so class info is preserved)
-    #     if np.random.rand() < 0.5:
-    #         noise = torch.randn_like(waveform) * 0.005
-    #         waveform = waveform + noise
-
-    #     # SpecAugment: time & frequency masking on the spectrogram level
-    #     # (applied after mel transform below — see note)
-    #     return waveform
+    def _spec_augment(self, spec):
+        """
+        spec: torch.Tensor of shape (1, n_mels, time)
+        """
+        import random
+        spec = spec.clone()
+        n_mels, time_steps = spec.shape[1], spec.shape[2]
+        
+        # Frequency masking (mask mel bins)
+        f_mask = random.randint(2, 5)
+        f0 = random.randint(0, max(1, n_mels - f_mask))
+        spec[:, f0:f0+f_mask, :] = spec.mean()
+        
+        # Time masking (mask time frames)  
+        t_mask = random.randint(10, 30)
+        t0 = random.randint(0, max(1, time_steps - t_mask))
+        spec[:, :, t0:t0+t_mask] = spec.mean()
+        
+        return spec
     
 
 
 class ESC50_DataLoader(Dataset):
 
-    def __init__(self, esc50_dir: Path, allowed_folds=None):
+    def __init__(self, esc50_dir: Path, allowed_folds=None, augment: bool=False):
         self.esc50_dir = esc50_dir
         self.audio_dir = esc50_dir / "audio"
         self.variables = Variables()
+        self.augment = augment
 
         self.meta_data = None
         self.allowed_folds = allowed_folds
@@ -151,19 +159,24 @@ class ESC50_DataLoader(Dataset):
         mel = self.variables.mel(waveform)
         mel = self.variables.db(mel)
 
-        mean = mel.mean()
-        std = mel.std() + 1e-6
+        # augment data for only training 
+        if self.augment:
+            mel = self.variables._spec_augment(spec=mel)
 
-        mel = (mel - mean) / std
+        # mean = mel.mean()
+        # std = mel.std() + 1e-6
+
+        # mel = (mel - mean) / std
 
         return mel, torch.tensor(label, dtype=torch.long)
 
 
 
 class GenreDataLoader(Dataset):
-    def __init__(self, root_dir: Path):
+    def __init__(self, root_dir: Path, augment: bool=False):
         self.root_dir = root_dir 
         self.variables = Variables()
+        self.augment = augment
 
         self.samples = []
         self.labels = []
@@ -232,13 +245,20 @@ class GenreDataLoader(Dataset):
             waveform = self.variables.highpass_filter(audio=waveform)
 
             # normalize amplitued 
-            max_val = waveform.abs().max()
-            if max_val > 0:
-                waveform = waveform / max_val
+            # max_val = waveform.abs().max()
+            # if max_val > 0:
+            #     waveform = waveform / max_val
 
             waveforms.append(waveform)
+        
 
-        full_waveform = torch.cat(waveforms, dim=1)
+        full_waveform = waveforms[0].clone()
+
+        for wave in waveforms[1:]:
+            full_waveform = full_waveform + wave
+
+        full_waveform = full_waveform / len(waveforms)
+
         full_waveform = self.variables._fix_length(full_waveform, duration=30)
 
         # get complete length of 30 sec data
@@ -256,12 +276,15 @@ class GenreDataLoader(Dataset):
             chunk_mel = self.variables.mel(full_waveform)
             chunk_mel = self.variables.db(chunk_mel)
 
-            chunk_mean = chunk_mel.mean()
-            chunk_std = chunk_mel.std() + 1e-6
-            
-            mel = (chunk_mel - chunk_mean) / chunk_std
+            if self.augment:
+                chunk_mel = self.variables._spec_augment(spec=chunk_mel)
 
-            chunks.append(mel)
+            # chunk_mean = chunk_mel.mean()
+            # chunk_std = chunk_mel.std() + 1e-6
+            
+            # mel = (chunk_mel - chunk_mean) / chunk_std
+
+            chunks.append(chunk_mel)
         
         else:
             for i in range(num_chunks):
@@ -272,14 +295,17 @@ class GenreDataLoader(Dataset):
                 chunk = full_waveform[:, start_idx: end_idx]
 
                 chunk_mel = self.variables.mel(chunk)
-                chunk_mel = self.variables.db(chunk)
+                chunk_mel = self.variables.db(chunk_mel)
 
-                chunk_mean = chunk_mel.mean()
-                chunk_std = chunk_mel.std() + 1e-6
+                if self.augment:
+                    chunk_mel = self.variables._spec_augment(spec=chunk_mel)
+
+                # chunk_mean = chunk_mel.mean()
+                # chunk_std = chunk_mel.std() + 1e-6
                 
-                mel = (chunk_mel - chunk_mean) / chunk_std
+                # mel = (chunk_mel - chunk_mean) / chunk_std
 
-                chunks.append(mel)
+                chunks.append(chunk_mel)
 
         chunks = torch.stack(chunks, dim=0)
         
@@ -306,4 +332,3 @@ def collate_fn_chunks(batch):
     labels = torch.tensor(labels, dtype=torch.long)
     
     return all_chunks, labels, chunk_counts
-
