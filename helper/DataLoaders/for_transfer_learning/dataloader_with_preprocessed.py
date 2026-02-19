@@ -210,6 +210,8 @@ class GenreDataLoader(Dataset):
                 self.samples.append(wav_parts)
                 self.labels.append(label_id)
 
+        print(self.samples)
+
         print("Classes:", self.class_map)
         print("Total songs:", len(self.samples))
 

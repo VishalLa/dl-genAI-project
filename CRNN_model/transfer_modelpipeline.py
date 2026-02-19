@@ -7,7 +7,7 @@ from torch.utils.data import WeightedRandomSampler, DataLoader, random_split
 
 
 from CRNN_model.crnn import CRNN
-from helper.DataLoaders.dataloader_with_preprocessed import GenreDataLoader, ESC50_DataLoader, collate_fn_chunks
+from helper.DataLoaders.for_transfer_learning.dataloader_with_preprocessed import GenreDataLoader, ESC50_DataLoader, collate_fn_chunks
 from helper.utils import train_esc50_model, train_genre_model
 
 

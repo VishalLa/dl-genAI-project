@@ -42,7 +42,6 @@ class ESC50_DataLoader_Waveform(Dataset):
         return self.meta_data.shape[0]
 
     def _fix_length(self, signal: torch.Tensor):
-        """Fix signal length to match CNN14 requirements (10 seconds at 32kHz)"""
         length = signal.shape[1]
 
         if length > self.SAMPLES:
