@@ -1,7 +1,7 @@
 import torch
 from pathlib import Path
 import torchaudio
-from helper.for_normal_learning.wave2vec2_dataloader import highpass_filter
+from helper.DataLoaders.for_normal_learning.wave2vec2_dataloader import highpass_filter
 from transformers import Wav2Vec2Processor
 
 processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base")

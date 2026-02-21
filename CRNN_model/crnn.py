@@ -27,26 +27,38 @@ class CRNN(nn.Module):
             bias=True
         )
 
-        self.lstm = nn.LSTM(linear_layer_out, rnn_hidden, bidirectional=True)
+        self.lstm = nn.LSTM(
+            linear_layer_out, 
+            rnn_hidden, 
+            num_layers=2, 
+            bidirectional=True,
+            dropout=0.3 
+        )
         self.lstm_dropout = nn.Dropout(0.3)
 
         self.attention = AudioMultiHeadAttention(
             n_embeddings=rnn_hidden*2,
-            n_heads=4,
+            n_heads=8,
             head_size=rnn_hidden // 2,
         )
 
-        self.head = nn.Linear(
+        self.fc1 = nn.Linear(
             in_features=2 * rnn_hidden,
+            out_features=rnn_hidden
+        )
+        self.fc1_dropout = nn.Dropout(0.3)
+
+        self.head = nn.Linear(
+            in_features=rnn_hidden,
             out_features=num_class
         )
 
     def cnn_backbone(self, channel: int, height: int, width: int):
 
-        channels     = [channel, 16, 32, 64, 128, 128]
-        kernel_sizes = [3, 3, 3, 3, 3]
-        strids       = [1, 1, 1, 1, 1]
-        paddings     = [1, 1, 1, 1, 1]
+        channels     = [channel, 16, 32, 64, 64, 128, 128, 256] 
+        kernel_sizes = [3, 3, 3, 3, 3, 3, 3, 3]
+        strids       = [1, 1, 1, 1, 1, 1, 1, 1]
+        paddings     = [1, 1, 1, 1, 1, 1, 1, 1]
 
         cnn = nn.Sequential()
 
@@ -62,29 +74,39 @@ class CRNN(nn.Module):
 
             cnn.add_module(f"relu{idx}", nn.LeakyReLU(0.2, inplace=True))
 
-        # [1,height,width]
+        # [1, height, width]
         conv_layer(0)
         cnn.add_module("polling0", nn.MaxPool2d(kernel_size=2, stride=2))
-        # [16,height/2,width/2 ]
+        # [16, height/2, width/2]
 
         conv_layer(1)
         cnn.add_module("polling1", nn.MaxPool2d(kernel_size=2, stride=2))
-        # [32,height/4,width/4 ]
+        # [32, height/4, width/4]
 
         conv_layer(2)
-        # [64,height/4,width/4 ]
+        # [64, height/4, width/4]
 
         conv_layer(3, batch_norm=True)
         cnn.add_module("polling2", nn.MaxPool2d(kernel_size=2, stride=2))
-        # [128,height/8,width/8 ]
+        # [64, height/8, width/8]
 
         conv_layer(4, batch_norm=True)
         cnn.add_module("polling3", nn.MaxPool2d(kernel_size=2, stride=2))
         # [128, height/16, width/16]
 
+        conv_layer(5, batch_norm=True)
+        cnn.add_module("polling4", nn.MaxPool2d(kernel_size=2, stride=2))
+        # [128, height/32, width/32]
+
+        conv_layer(6, batch_norm=True)
+        cnn.add_module("polling5", nn.MaxPool2d(kernel_size=2, stride=2))
+        # [256, height/64, width/64]
+
+        # conv_layer(7, batch_norm=True) 
+
         output_channel = channels[-1]
-        output_height  = height // 16
-        output_width   = width  // 16
+        output_height  = height // 64
+        output_width   = width  // 64
 
         return cnn, (output_channel, output_height, output_width)
     
@@ -112,8 +134,12 @@ class CRNN(nn.Module):
 
         recurrent = recurrent.permute(1, 0, 2)
 
-        context   = self.attention(recurrent)
-        context   = context.mean(dim=1)
+        context = self.attention(recurrent)
+        context = context.mean(dim=1)
 
-        return self.head(context)
-            
+        x = self.fc1(context)
+        x = F.leaky_relu(x, 0.2)
+        x = self.fc1_dropout(x)
+
+        return self.head(x)
+    
