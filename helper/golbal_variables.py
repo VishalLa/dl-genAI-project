@@ -5,6 +5,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 MESSY_DATA_DIR = PROJECT_ROOT / "data"
 ESC_50_MASTER = MESSY_DATA_DIR / "ESC-50-master"
 GENRES_STEMS = MESSY_DATA_DIR / "genres_stems"
+GENRES_MEL = MESSY_DATA_DIR / "genres_mel"
 MASHUPS = MESSY_DATA_DIR / "mashups"
 
 BLUES = GENRES_STEMS / "blues"

@@ -160,79 +160,59 @@ class GenreDataset:
     
 
     def inject_esc50_noise(self, music_waveform: torch.Tensor) -> torch.Tensor:
-
-        if random.random() > 0.8:
-            return music_waveform 
-        
         samples = music_waveform.shape[1]
-
         n_events = random.randint(1, 3)
 
         for _ in range(n_events):
             noise_path = random.choice(self.esc50_paths)
             noise_wave, sr = torchaudio.load(noise_path)
-
             noise_wave = noise_wave.mean(dim=0, keepdim=True)
 
             if sr != self.variables.SAMPLE_RATE:
                 resampler = torchaudio.transforms.Resample(sr, self.variables.SAMPLE_RATE)
                 noise_wave = resampler(noise_wave)
 
-            # choose random position in 30 sec song
             noise_len = noise_wave.shape[1]
-
             if noise_len >= samples:
                 noise_wave = noise_wave[:, :samples]
                 start = 0
             else:
                 start = random.randint(0, samples - noise_len)
 
-            # choose noise loudness (SNR control)
-            alpha = random.uniform(0.05, 0.25)
-
-            # inject
+            alpha = random.uniform(0.15, 0.45)
             music_waveform[:, start:start+noise_len] += alpha * noise_wave
 
+        # Re-normalize to avoid clipping
         max_val = music_waveform.abs().max()
         if max_val > 0:
             music_waveform = music_waveform / max_val 
 
         return music_waveform
 
-
     def process_song(self, song_dir: Path, genre_name: str):
-
         match = re.search(r"\.(\d+)", song_dir.name)
-        if match is None:
-            return 
+        if match is None: return 
         
         song_id = match.group(1)
-
         out_folder = self.output_dir / genre_name 
         out_folder.mkdir(parents=True, exist_ok=True)
 
         wav_paths = sorted(song_dir.glob("*.wav"))
-        if len(wav_paths) == 0:
-            return 
+        if len(wav_paths) == 0: return 
 
-        # ---------------- CLEAN SONG ----------------
+        # 1. Always generate and save CLEAN
         clean_waveform = self.merge_song(wav_paths)
-
         clean_save = out_folder / f"{song_id}_clean.png"
         self.save_spectrogram(clean_waveform, clean_save)
 
-        print(f"Saved CLEAN {genre_name}/{song_id}_clean.png")
+        # 2. Always generate and save NOISE (Removed the 0.8 random check)
+        noisy_waveform = clean_waveform.clone()
+        noisy_waveform = self.inject_esc50_noise(noisy_waveform)
 
-        # ---------------- NOISY SONG (70%) ----------------
-        if random.random() < 0.8:
-
-            noisy_waveform = clean_waveform.clone()
-            noisy_waveform = self.inject_esc50_noise(noisy_waveform)
-
-            noise_save = out_folder / f"{song_id}_noise.png"
-            self.save_spectrogram(noisy_waveform, noise_save)
-
-            print(f"Saved NOISE {genre_name}/{song_id}_noise.png")
+        noise_save = out_folder / f"{song_id}_noise.png"
+        self.save_spectrogram(noisy_waveform, noise_save)
+        
+        print(f"Generated pair: {genre_name} {song_id}")
 
     
     def process_all(self):
@@ -253,12 +233,78 @@ class GenreDataset:
         print("\nALL SONGS CONVERTED SUCCESSFULLY")
 
 
-if __name__ == "__main__":
-    genredataset = GenreDataset(
-        genre_dir=Path("Z:\\dlgen-AI-project\\data\\genres_stems"),
-        output_dir=Path("Z:\\dlgen-AI-project\\data\\genres_mel"),
-        esc50_dir=Path("Z:\\dlgen-AI-project\\data\\ESC-50-master")
-    )
+class MashUP:
+    def __init__(self, mashup_dir: Path, output_dir: Path):
+        self.mashup_dir = mashup_dir 
+        self.output_dir = output_dir
+        
+        self.variable = Variables()
+        
+        os.makedirs(self.output_dir, exist_ok=True)
 
-    genredataset.process_all()
+
+    def save_spectrogram(self, waveform: torch.Tensor, save_path: Path):
+
+        save_path = save_path.with_suffix(".png")
+
+        mel = self.variable.mel(waveform)
+        mel = self.variable.db(mel)
+
+        mel = (mel + 80) / 80
+        mel_np = mel.squeeze(0).cpu().numpy()
+
+        plt.figure(figsize=(6,4))
+        librosa.display.specshow(
+            mel_np,
+            sr=self.variable.SAMPLE_RATE,
+            hop_length=256,
+            x_axis=None,
+            y_axis=None,
+            cmap="magma"
+        )
+
+        plt.axis("off")
+        plt.tight_layout(pad=0)
+
+        plt.savefig(str(save_path), format="png", bbox_inches="tight", pad_inches=0, dpi=100)
+        plt.close()
+
+        return save_path
+
+    
+    def process_all(self):
+        for audio_path in sorted(self.mashup_dir.iterdir()):
+
+            if audio_path.is_dir():
+                continue
+
+            waveform, sr = torchaudio.load(audio_path)
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+            if sr != self.variable.SAMPLE_RATE:
+                resampler = torchaudio.transforms.Resample(sr, self.variable.SAMPLE_RATE)
+                waveform = resampler(waveform)
+
+            waveform = self.variable.highpass_filter(audio=waveform)
+
+            song_id = audio_path.stem
+            save_path = self.output_dir / f"{song_id}.png"
+            save_path = self.save_spectrogram(save_path=save_path, waveform=waveform)
+            print(f"saved at: {save_path}")
+
+
+if __name__ == "__main__":
+    # genredataset = GenreDataset(
+    #     genre_dir=Path("Z:\\dlgen-AI-project\\data\\genres_stems"),
+    #     output_dir=Path("Z:\\dlgen-AI-project\\data\\genres_mel"),
+    #     esc50_dir=Path("Z:\\dlgen-AI-project\\data\\ESC-50-master")
+    # )
+
+    # genredataset.process_all()
+
+    mashup = MashUP(
+        mashup_dir=Path("Z:\\dlgen-AI-project\\data\\mashups"),
+        output_dir=Path("Z:\\dlgen-AI-project\\data\\mashups_image")
+    )
+    mashup.process_all()
 
