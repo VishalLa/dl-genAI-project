@@ -8,7 +8,7 @@ from torch.utils.data import WeightedRandomSampler, DataLoader, random_split
 
 from CRNN_model.crnn import CRNN
 from helper.DataLoaders.for_normal_learning.crnn_dataloader_for_images import ImageDataset_for_CRNN 
-from helper.utils import train_on_pre_loaded_images
+from CRNN_model.utils import train_on_pre_loaded_images
 
 
 class ModelPipeline:
