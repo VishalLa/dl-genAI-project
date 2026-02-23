@@ -83,9 +83,15 @@ class Audio_DataLoader(Dataset):
 
             for c in range(n_chunks):
                 start = c * self.CHUNK_SAMPLES
-                self.index_map.append((song_idx, start))
 
-        print("Total training segments:", len(self.index_map))
+                for augment_version in range(4):
+                    self.index_map.append((song_idx, start, augment_version))
+
+        print(f"Total training segments: {len(self.index_map)}")
+        print(f"  - Clean segments (v0): {len(self.index_map) // 4}")
+        print(f"  - 2-noise segments (v1): {len(self.index_map) // 4}")
+        print(f"  - 3-noise segments (v2): {len(self.index_map) // 4}")
+        print(f"  - 4-noise segments (v3): {len(self.index_map) // 4}")
 
     def __len__(self):
         return len(self.index_map)
@@ -131,21 +137,56 @@ class Audio_DataLoader(Dataset):
 
         return chunk
 
-    def inject_esc50_noise(self, music_waveform):
+    # def inject_esc50_noise(self, music_waveform):
 
-        if random.random() > 0.8:
+    #     if random.random() > 0.8:
+    #         return music_waveform
+
+    #     samples = music_waveform.shape[1]
+    #     n_events = random.randint(1, 2)
+
+    #     for _ in range(n_events):
+
+    #         noise_path = random.choice(self.esc50_paths)
+    #         noise_wave, sr = torchaudio.load(noise_path)
+
+    #         noise_wave = noise_wave.mean(dim=0, keepdim=True)
+
+    #         if sr != self.SAMPLE_RATE:
+    #             resampler = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)
+    #             noise_wave = resampler(noise_wave)
+
+    #         noise_len = noise_wave.shape[1]
+
+    #         if noise_len >= samples:
+    #             noise_wave = noise_wave[:, :samples]
+    #             start = 0
+    #         else:
+    #             start = random.randint(0, samples - noise_len)
+
+    #         snr_db = random.uniform(8, 18)
+
+    #         music_power = music_waveform.pow(2).mean()
+    #         noise_power = noise_wave.pow(2).mean() + 1e-9
+
+    #         scale = torch.sqrt(music_power / (noise_power * (10 ** (snr_db / 10))))
+    #         music_waveform[:, start:start+noise_len] += scale * noise_wave
+
+    #     return music_waveform
+
+
+    def inject_esc50_noise(self, music_waveform: torch.Tensor, n_events: int):
+        if n_events == 0:
             return music_waveform
-
+        
         samples = music_waveform.shape[1]
-        n_events = random.randint(1, 2)
 
         for _ in range(n_events):
-
+            
             noise_path = random.choice(self.esc50_paths)
             noise_wave, sr = torchaudio.load(noise_path)
 
             noise_wave = noise_wave.mean(dim=0, keepdim=True)
-
             if sr != self.SAMPLE_RATE:
                 resampler = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)
                 noise_wave = resampler(noise_wave)
@@ -154,11 +195,11 @@ class Audio_DataLoader(Dataset):
 
             if noise_len >= samples:
                 noise_wave = noise_wave[:, :samples]
-                start = 0
-            else:
+                start = 0 
+            else: 
                 start = random.randint(0, samples - noise_len)
 
-            snr_db = random.uniform(8, 18)
+            snr_db = random.uniform(10, 18)
 
             music_power = music_waveform.pow(2).mean()
             noise_power = noise_wave.pow(2).mean() + 1e-9
@@ -168,15 +209,20 @@ class Audio_DataLoader(Dataset):
 
         return music_waveform
 
+
     def __getitem__(self, index):
-        song_idx, start = self.index_map[index]
+        # song_idx, start = self.index_map[index]
+        song_idx, start, augment_version = self.index_map[index]
         
         wave_list = self.samples[song_idx]
         label = self.labels[song_idx]
 
         full_waveform = self.merge_song(wave_list)
         full_waveform = self.get_chunk(full_waveform, start)
-        full_waveform = self.inject_esc50_noise(full_waveform)
+        # full_waveform = self.inject_esc50_noise(full_waveform)
+
+        n_noise_events = [0, 2, 3, 4][augment_version]
+        full_waveform = self.inject_esc50_noise(full_waveform, n_noise_events)
 
         rms = torch.sqrt(torch.mean(full_waveform**2) + 1e-9)
         full_waveform = full_waveform / (rms * 3.0)
