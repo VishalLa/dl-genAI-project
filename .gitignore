@@ -10,6 +10,7 @@ wandb/
 test.py
 *.idea
 *.zip
+*.csv
 /data
 data/
 *.pth
