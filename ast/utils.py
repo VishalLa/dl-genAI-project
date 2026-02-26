@@ -1,56 +1,95 @@
-import torch 
+import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import GradScaler, autocast
+import numpy as np
 import time
 import wandb
 
-import torch
-from torch.cuda.amp import autocast, GradScaler
+
+def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.2):
+    """Returns mixed inputs, pairs of targets, and lambda."""
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
 
 
-def train_ast(model, dataloader, loss_function, optimizer, device, scaler):
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+def train_ast(model, dataloader, loss_function, optimizer, device,
+              use_mixup=True, scaler=None, grad_accum_steps=1):
+    """
+    Training loop with three memory-saving techniques for Stage 3:
+      - Mixed-precision (AMP): halves activation memory automatically
+      - Gradient accumulation: lets you simulate a larger batch with less VRAM
+      - Gradient checkpointing: trades compute for memory in the encoder
+        (enabled on the model before calling this function)
+    """
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
 
-    for input_values, labels in dataloader:
+    optimizer.zero_grad()
+
+    for step, (input_values, labels) in enumerate(dataloader):
         input_values = input_values.to(device)
         labels = labels.to(device)
 
-        optimizer.zero_grad()
+        # forward (with AMP if scaler provided) 
+        with autocast("cuda", enabled=...):
+            if use_mixup:
+                input_values, labels_a, labels_b, lam = mixup_data(input_values, labels, alpha=0.2)
+                logits = model(input_values)
+                loss = mixup_criterion(loss_function, logits, labels_a, labels_b, lam)
+            else:
+                logits = model(input_values)
+                loss = loss_function(logits, labels)
 
-        # 1. Cast the forward pass to 16-bit precision
-        with autocast():
-            logits = model(input_values)
-            loss = loss_function(logits, labels)
-        
+            # Scale loss for gradient accumulation
+            loss = loss / grad_accum_steps
+
         if torch.isnan(loss):
-            print(f"⚠ NaN loss detected, skipping batch")
+            print("nan loss detected, skipping batch")
+            optimizer.zero_grad()
             continue
 
-        # 2. Scale the loss and do the backward pass
-        scaler.scale(loss).backward()
-        
-        # 3. Unscale gradients before clipping
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        # 4. Step the optimizer and update the scaler
-        scaler.step(optimizer)
-        scaler.update()
+        # backward 
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
-        running_loss += loss.item()
+        # optimizer step every grad_accum_steps batches 
+        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            optimizer.zero_grad()
+
+        running_loss += loss.item() * grad_accum_steps   # un-scale for logging
         _, predicted = torch.max(logits, 1)
-        correct += (predicted == labels).sum().item()
-        total += labels.size(0)
+        ref_labels = labels if not use_mixup else labels_a
+        correct += (predicted == ref_labels).sum().item()
+        total += ref_labels.size(0)
 
     epoch_loss = running_loss / len(dataloader)
     accuracy = 100 * correct / total
-
     return epoch_loss, accuracy
 
+
 def test_ast(model, dataloader, loss_function, device):
+    """Chunk-level evaluation (fast, used every epoch)."""
     model.eval()
     running_loss = 0.0
     correct = 0
@@ -62,7 +101,6 @@ def test_ast(model, dataloader, loss_function, device):
             labels = labels.to(device)
 
             logits = model(input_values)
-            
             loss = loss_function(logits, labels)
 
             running_loss += loss.item()
@@ -72,24 +110,81 @@ def test_ast(model, dataloader, loss_function, device):
 
     loss = running_loss / len(dataloader) if len(dataloader) > 0 else 0
     accuracy = 100 * correct / total if total > 0 else 0
-
     return loss, accuracy
 
-def train_ast_model(model, device, train_loader, val_loader, epochs=20):
-    
-    print("\n" + "="*70)
-    print("AST GENRE CLASSIFICATION TRAINING (2-STAGE)")
-    print("="*70 + "\n")
-    
-    if device == "cuda":
+
+def test_ast_song_level(model, dataset_subset, original_dataset, device):
+    """
+    Song-level evaluation using majority voting across all chunks of a song.
+
+    Args:
+        dataset_subset : torch Subset wrapping Fast_AST_Dataset (val split)
+        original_dataset: the underlying Fast_AST_Dataset (has index_map + labels)
+    Returns:
+        song_accuracy (float)
+    """
+    model.eval()
+
+    # Collect per-chunk predictions grouped by song_idx
+    song_preds = {}   # song_idx -> list of predicted class ints
+    song_labels = {}  # song_idx -> true label
+
+    with torch.no_grad():
+        for i, real_idx in enumerate(dataset_subset.indices):
+            spec, label = original_dataset[real_idx]
+            spec = spec.unsqueeze(0).to(device)
+
+            logits = model(spec)
+            pred = torch.argmax(logits, dim=1).item()
+            label_val = label.item() if isinstance(label, torch.Tensor) else label
+
+            song_idx = original_dataset.index_map[real_idx][0]
+
+            if song_idx not in song_preds:
+                song_preds[song_idx] = []
+                song_labels[song_idx] = label_val
+
+            song_preds[song_idx].append(pred)
+
+    # Majority vote
+    correct = 0
+    for song_idx, preds in song_preds.items():
+        voted = max(set(preds), key=preds.count)
+        if voted == song_labels[song_idx]:
+            correct += 1
+
+    return 100 * correct / len(song_preds) if song_preds else 0
+
+
+
+def train_ast_model(model, device, train_loader, val_loader,
+                    val_dataset_subset=None, original_dataset=None,
+                    epochs=30):
+
+    print("\n" + "=" * 70)
+    print("AST GENRE CLASSIFICATION TRAINING  (v2)")
+    print("=" * 70 + "\n")
+
+    use_cuda = (device == "cuda")
+    if use_cuda:
         torch.cuda.empty_cache()
+
+    # AMP scaler — only meaningful on CUDA
+    scaler = GradScaler() if use_cuda else None
 
     wandb.init(
         project="ast-genre-classification",
-        name="2-stage-golden-run",
+        name="3-stage-v2-mixup-specaug-amp",
         config={
             "epochs": epochs,
             "optimizer": "AdamW",
+            "mixup_alpha": 0.2,
+            "label_smoothing": 0.1,
+            "spec_augment": True,
+            "amp": use_cuda,
+            "grad_checkpointing_stage3": True,
+            "grad_accum_stage3": 4,
+            "scheduler": "CosineAnnealingLR",
             "dataset": "Genre",
             "architecture": model.__class__.__name__,
             "base_model": "ast-finetuned-audioset-10-10-0.4593",
@@ -98,122 +193,169 @@ def train_ast_model(model, device, train_loader, val_loader, epochs=20):
     wandb.watch(model, log="all", log_freq=50)
 
     model = model.to(device)
-    loss_function = nn.CrossEntropyLoss()
-    
+
+    loss_function = nn.CrossEntropyLoss(label_smoothing=0.1)
+
     start_time = time.time()
-    best_val_acc = 0
+    best_val_acc = 0.0
     best_val_loss = float('inf')
-    
-    # Split the epochs exactly in half for the 2 stages
-    change_stage = epochs // 2
+
+    # Stage boundaries — 40 / 30 / 30 split
+    stage2_start = int(epochs * 0.30)  # head trains for 30%
+    stage3_start = int(epochs * 0.80)  # partial unfreeze gets 50%
 
     optimizer = None
     scheduler = None
-
-    # Initialize the scaler outside your training loop in your main script
-    scaler = GradScaler() 
+    grad_accum_steps = 1   # updated per stage
 
     for epoch in range(epochs):
         epoch_start = time.time()
-        
+
         if epoch == 0:
-            print(f"STAGE 1: Training only classifier head (lr=1e-3)")
-            
-            # Freeze everything
+            print(f"STAGE 1: Classifier head only  (lr=1e-3, epochs 1-{stage2_start})")
+
             for param in model.parameters():
                 param.requires_grad = False
-            
-            # Unfreeze only the classification head
             for param in model.classifier.parameters():
                 param.requires_grad = True
-            
-            # Upgraded to AdamW with higher weight decay for regularization
-            optimizer = torch.optim.AdamW(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                lr=1e-3,
-                weight_decay=0.01 
-            )
-            scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=4, min_lr=1e-6)
-            
-            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in model.parameters())
-            print(f"        Trainable: {trainable:,} / {total_params:,}")
-            print(f"{'='*70}\n")
-            
-            wandb.log({"stage": "classifier_only"}, step=epoch)
 
-        elif epoch == change_stage:
-            print(f"\n{'='*70}")
-            print(f"STAGE 2: Unfreezing top 4 AST encoder layers (lr=5e-5)")
-            
-            # Unfreeze layers 8, 9, 10, and 11 to capture deeper audio features
-            for name, param in model.named_parameters():
-                if any(f"encoder.layer.{i}" in name for i in [8, 9, 10, 11]):
-                    param.requires_grad = True
-            
-            # Upgraded to AdamW
+            grad_accum_steps = 1
+
             optimizer = torch.optim.AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
-                lr=5e-5,
-                weight_decay=0.01
+                lr=1e-3, weight_decay=1e-4
             )
-            scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6)
+            scheduler = CosineAnnealingLR(optimizer, T_max=stage2_start, eta_min=1e-5)
+
+            _print_trainable(model, epoch + 1, epochs)
+            wandb.log({"stage": 1}, step=epoch)
+
+        elif epoch == stage2_start:
+            print(f"\n{'=' * 70}")
+            print(f"STAGE 2: Layers 8-11 unfrozen  (lr=5e-5, epochs {stage2_start+1}-{stage3_start})")
+
+            for name, param in model.named_parameters():
+                for layer in ["encoder.layer.8", "encoder.layer.9",
+                               "encoder.layer.10", "encoder.layer.11"]:
+                    if layer in name:
+                        param.requires_grad = True
+
+            grad_accum_steps = 1
+
+            optimizer = torch.optim.AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=5e-5, weight_decay=1e-4
+            )
+            n_epochs_stage2 = stage3_start - stage2_start
+            scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs_stage2, eta_min=5e-6)
+
+            _print_trainable(model, epoch + 1, epochs)
+            wandb.log({"stage": 2}, step=epoch)
+
+        elif epoch == stage3_start:
+            print(f"\n{'=' * 70}")
+            print(f"STAGE 3: Full fine-tune  (lr=1e-5, epochs {stage3_start+1}-{epochs})")
+            print(f"         [AMP + gradient checkpointing + grad accum x4]")
+
+            # Unfreeze everything except embeddings
+            for name, param in model.named_parameters():
+                if "embeddings" not in name:
+                    param.requires_grad = True
+            model.ast.audio_spectrogram_transformer.encoder.gradient_checkpointing = True
             
-            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in model.parameters())
-            print(f"        Trainable: {trainable:,} / {total_params:,}")
-            print(f"{'='*70}\n")
-            
-            wandb.log({"stage": "partial_unfreeze"}, step=epoch)
+            grad_accum_steps = 4
+
+            optimizer = torch.optim.AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=1e-5, weight_decay=5e-3
+            )
+            n_epochs_stage3 = epochs - stage3_start
+            scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs_stage3, eta_min=1e-7)
+
+            if use_cuda:
+                torch.cuda.empty_cache()
+
+            _print_trainable(model, epoch + 1, epochs)
+            wandb.log({"stage": 3}, step=epoch)
+
+        # ------------------------------------------------------------------
+        # Forward pass
+        # ------------------------------------------------------------------
+        use_mixup = (epoch >= stage2_start)
 
         train_loss, train_acc = train_ast(
-            model, train_loader, loss_function, optimizer, device, scaler
+            model, train_loader, loss_function, optimizer, device,
+            use_mixup=use_mixup, scaler=scaler, grad_accum_steps=grad_accum_steps
         )
-        
-        val_loss, val_acc = test_ast(
+        val_loss, val_acc_chunk = test_ast(
             model, val_loader, loss_function, device
         )
-        
-        scheduler.step(val_loss)
-        
+
+        # Song-level majority vote (only if caller provides the subset + dataset)
+        val_acc_song = None
+        if val_dataset_subset is not None and original_dataset is not None:
+            val_acc_song = test_ast_song_level(
+                model, val_dataset_subset, original_dataset, device
+            )
+
+        scheduler.step()
+
         epoch_time = time.time() - epoch_start
         current_lr = optimizer.param_groups[0]["lr"]
 
-        wandb.log({
+        log_dict = {
             "epoch": epoch + 1,
             "train_loss": train_loss,
             "train_accuracy": train_acc,
             "val_loss": val_loss,
-            "val_accuracy": val_acc,
+            "val_accuracy_chunk": val_acc_chunk,
             "learning_rate": current_lr,
             "epoch_time": epoch_time,
-        })
+        }
+        if val_acc_song is not None:
+            log_dict["val_accuracy_song"] = val_acc_song
 
+        wandb.log(log_dict)
+
+        song_str = f" | Song Acc: {val_acc_song:6.2f}%" if val_acc_song is not None else ""
         print(
             f"Epoch [{epoch+1:3d}/{epochs}] | "
             f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:6.2f}% | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:6.2f}% | "
-            f"LR: {current_lr:.2e} | Time: {epoch_time:.1f}s"
+            f"Val Loss: {val_loss:.4f} | Chunk Acc: {val_acc_chunk:6.2f}%"
+            f"{song_str} | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s"
         )
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Save on best chunk-level val acc (or song-level if available)
+        primary_acc = val_acc_song if val_acc_song is not None else val_acc_chunk
+        if primary_acc > best_val_acc:
+            best_val_acc = primary_acc
             best_val_loss = val_loss
             torch.save(model.state_dict(), "best_ast_genre.pth")
             wandb.save("best_ast_genre.pth")
-            print(f"        ✓ Saved best model (val_acc: {val_acc:.2f}%, val_loss: {val_loss:.4f})")
+            metric_name = "song_acc" if val_acc_song is not None else "chunk_acc"
+            print(f"        ✓ Saved best model ({metric_name}: {primary_acc:.2f}%, val_loss: {val_loss:.4f})")
 
     total_time = time.time() - start_time
-    
-    print(f"\n{'='*70}")
-    print(f"AST TRAINING COMPLETE")
-    print(f"{'='*70}")
-    print(f"Total Training Time    : {total_time/60:.1f} minutes")
+
+    print(f"\n{'=' * 70}")
+    print(f"AST TRAINING COMPLETE  (v2)")
+    print(f"{'=' * 70}")
+    print(f"Total Training Time    : {total_time / 60:.1f} minutes")
     print(f"Best Validation Acc    : {best_val_acc:.2f}%")
     print(f"Best Validation Loss   : {best_val_loss:.4f}")
     print(f"Model saved as         : best_ast_genre.pth")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     wandb.finish()
-    
     return best_val_acc
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def _print_trainable(model, current_epoch, total_epochs):
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"        Trainable: {trainable:,} / {total:,}")
+    print(f"{'=' * 70}\n")

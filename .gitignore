@@ -17,5 +17,6 @@ data/
 *.pth
 output.csv
 log.txt
+*.log
 /test
 test/
