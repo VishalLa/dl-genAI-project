@@ -14,13 +14,14 @@ class ASTGenreClassifier(nn.Module):
         defaults will yield a similar configuration to that of the AST
         """
         config = ASTConfig.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
-        config.hidden_dropout_prob = 0.1
-        config.attention_probs_dropout_prob = 0.1
+        # config.hidden_dropout_prob = 0.1
+        # config.attention_probs_dropout_prob = 0.1
+        config.num_labels=num_classes
 
         self.ast = ASTForAudioClassification.from_pretrained(
             "MIT/ast-finetuned-audioset-10-10-0.4593",
             config=config,
-            num_labels=num_classes,
+            # num_labels=num_classes,
             ignore_mismatched_sizes=True
         )
 
