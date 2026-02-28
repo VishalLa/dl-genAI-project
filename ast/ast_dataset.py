@@ -6,13 +6,21 @@ from pathlib import Path
 
 class Fast_AST_Dataset(Dataset):
 
+    """
+    Dataset class for ast model which loads pre computed spectrum from genre_pt folder
+
+    arguments:
+        data_dir: path for genre_pt folder 
+        train: bool value if true data will be agumented 
+    """
+
     def __init__(self, data_dir: Path, train: bool = True):
         self.data_dir = data_dir
         self.train = train
 
-        self.samples = []
+        self.samples = []       # list of all chunks from data 
         self.labels = []
-        self.class_map = {}
+        self.class_map = {}     # dict for storing index and name of genre
         self.index_map = []   # list of (global_song_idx, chunk_num)
 
         self._load_files()
@@ -21,8 +29,13 @@ class Fast_AST_Dataset(Dataset):
         print(f"[{mode}] Loaded {len(self.samples)} pre-computed spectrogram chunks.")
 
     def _load_files(self):
+        """
+        load all files in samples list
+        """
+
         global_song_counter = 0
 
+        # iterate over upper dir like blue, classical etc
         for label_id, genre_dir in enumerate(sorted(self.data_dir.iterdir())):
             if not genre_dir.is_dir():
                 continue

@@ -9,25 +9,37 @@ from tqdm import tqdm
 
 from transformers import ASTFeatureExtractor 
 import torch
-import numpy as np
-from scipy.signal import butter, filtfilt
+
+from utils import highpass_filter
 
 from helper.golbal_variables import *
 
-
-def highpass_filter(audio: torch.Tensor, cutoff: int = 40, sample_rate: int = 16000):
-    b, a = butter(5, cutoff / (sample_rate / 2), btype='high')
-
-    audio_np = audio.squeeze(0).cpu().numpy()
-
-    filtered = filtfilt(b, a, audio_np)
-    filtered = np.ascontiguousarray(filtered)
-    filtered = torch.from_numpy(filtered).unsqueeze(0)
-
-    return filtered.type_as(audio)
-
 class AST_Audio_DataLoader(Dataset):
+
+    """
+    Custom PyTorch Dataset for preparing audio data for Audio Spectrogram Transformer (AST).
+
+    This dataset:
+    - Loads multi-stem music (.wav) files
+    - Converts to mono and resamples to 16kHz
+    - Applies high-pass filtering
+    - Merges stems into a single waveform
+    - Splits audio into 10.24-second chunks (1024 spectrogram frames)
+    - Optionally injects ESC-50 environmental noise
+    - Normalizes waveform
+    - Returns 1D waveform + label
+
+    Each song may generate multiple training samples (chunks).
+    """
+
     def __init__(self, genre_dir: Path, esc50_dir: Path):
+
+        """
+        Args:
+            genre_dir (Path): Root directory containing genre folders.
+            esc50_dir (Path): Root directory containing ESC-50 noise files.
+        """
+
         self.genre_dir = genre_dir
         self.esc50_paths = list(esc50_dir.rglob("*.wav"))
 
@@ -46,6 +58,24 @@ class AST_Audio_DataLoader(Dataset):
 
 
     def _load_files(self):
+
+        """
+        Loads all song stems from genre directory.
+
+        Expected structure:
+            genre/
+                song_1/
+                    bass.wav
+                    drums.wav
+                    vocals.wav
+                    other.wav
+
+        Builds:
+            self.samples → list of list of wav paths
+            self.labels → genre label per song
+            self.class_map → {genre_name: label_id}
+        """
+
         for label_id, genre_dir in enumerate(sorted(self.genre_dir.iterdir())):
 
             if not genre_dir.is_dir():
@@ -66,6 +96,14 @@ class AST_Audio_DataLoader(Dataset):
                 self.labels.append(label_id)
 
     def _build_index_map(self):
+
+        """
+        Builds an index mapping from dataset index → (song_index, chunk_start_sample).
+
+        Each song is divided into multiple 10.24-second chunks.
+        This allows each chunk to act as an independent training sample.
+        """
+
         self.index_map = []
         for song_idx in range(len(self.samples)):
             waveform, sr = torchaudio.load(self.samples[song_idx][0])
@@ -85,6 +123,7 @@ class AST_Audio_DataLoader(Dataset):
         print("Total training segments:", len(self.index_map))
 
     def __len__(self):
+        """Returns total number of audio chunks in dataset."""
         return len(self.index_map)
 
     def merge_song(self, wave_list):
@@ -114,6 +153,20 @@ class AST_Audio_DataLoader(Dataset):
         return full_waveform
 
     def get_chunk(self, waveform: torch.Tensor, start: int):
+
+        """
+        Extracts a 10.24-second chunk from waveform.
+
+        Pads if the remaining samples are shorter than chunk size.
+
+        Args:
+            waveform (torch.Tensor): Input waveform [1, samples]
+            start (int): Starting sample index
+
+        Returns:
+            torch.Tensor: Chunked waveform [1, CHUNK_SAMPLES]
+        """
+
         end = start + self.CHUNK_SAMPLES
 
         if waveform.shape[1] < end:
@@ -125,6 +178,21 @@ class AST_Audio_DataLoader(Dataset):
         return chunk
 
     def inject_esc50_noise(self, music_waveform):
+
+        """
+        Randomly injects environmental noise from ESC-50 dataset.
+
+        - 20% probability of skipping injection
+        - Random 1–2 noise events
+        - Random SNR between 8–18 dB
+
+        Args:
+            music_waveform (torch.Tensor): Clean music waveform
+
+        Returns:
+            torch.Tensor: Augmented waveform
+        """
+
         if random.random() > 0.8:
             return music_waveform
         
@@ -157,6 +225,14 @@ class AST_Audio_DataLoader(Dataset):
         return music_waveform
 
     def __getitem__(self, index):
+
+        """
+        Returns:
+            Tuple:
+                - 1D normalized waveform tensor [samples]
+                - genre label tensor (long)
+        """
+
         song_idx, start = self.index_map[index]
         wave_list = self.samples[song_idx]
         label = self.labels[song_idx]

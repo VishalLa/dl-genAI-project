@@ -3,20 +3,10 @@ from pathlib import Path
 import torchaudio
 import numpy as np
 from transformers import ASTFeatureExtractor
-from scipy.signal import butter, filtfilt
+
+from utils import highpass_filter
 
 feature_extractor = ASTFeatureExtractor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
-
-
-def highpass_filter(audio: torch.Tensor, cutoff: int = 40, sample_rate: int = 16000):
-    b, a = butter(5, cutoff / (sample_rate / 2), btype='high')
-
-    audio_np = audio.squeeze(0).cpu().numpy()
-    filtered = filtfilt(b, a, audio_np)
-
-    filtered = np.ascontiguousarray(filtered)
-    filtered = torch.from_numpy(filtered).unsqueeze(0)
-    return filtered.type_as(audio)
 
 
 def _load_and_preprocess(audio_path, sample_rate: int = 16000) -> torch.Tensor:

@@ -5,6 +5,36 @@ from torch.amp import GradScaler, autocast
 import numpy as np
 import time
 import wandb
+from scipy.signal import butter, filtfilt
+
+
+from helper.golbal_variables import *
+
+
+def highpass_filter(audio: torch.Tensor, cutoff: int = 40, sample_rate: int = 16000):
+
+    """
+    Applies a Butterworth high-pass filter to remove very low-frequency noise.
+
+    Args:
+        audio (torch.Tensor): Input waveform tensor of shape [1, samples].
+        cutoff (int): Cutoff frequency in Hz. Default is 40 Hz.
+        sample_rate (int): Sampling rate of the waveform. Default is 16000 Hz.
+
+    Returns:
+        torch.Tensor: Filtered waveform with same shape and dtype as input.
+    """
+
+    b, a = butter(5, cutoff / (sample_rate / 2), btype='high')
+
+    audio_np = audio.squeeze(0).cpu().numpy()
+
+    filtered = filtfilt(b, a, audio_np)
+    filtered = np.ascontiguousarray(filtered)
+    filtered = torch.from_numpy(filtered).unsqueeze(0)
+
+    return filtered.type_as(audio)
+
 
 
 def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
@@ -41,7 +71,7 @@ def train_ast(model, dataloader, loss_function, optimizer, device,
         input_values = input_values.to(device)
         labels = labels.to(device)
 
-        # ---- forward (with AMP if scaler provided) ----------------------
+        # forward (with AMP if scaler provided)
         with autocast("cuda", enabled=(scaler is not None)):
             if use_mixup:
                 input_values, labels_a, labels_b, lam = mixup_data(input_values, labels, alpha=mixup_alpha)
@@ -59,13 +89,13 @@ def train_ast(model, dataloader, loss_function, optimizer, device,
             optimizer.zero_grad()
             continue
 
-        # ---- backward ---------------------------------------------------
+        # backward
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        # ---- optimizer step every grad_accum_steps batches --------------
+        # optimizer step every grad_accum_steps batches
         if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
             if scaler is not None:
                 scaler.unscale_(optimizer)
