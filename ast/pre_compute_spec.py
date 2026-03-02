@@ -197,7 +197,7 @@ class AST_Audio_DataLoader(Dataset):
             return music_waveform
         
         samples = music_waveform.shape[1]
-        n_events = random.randint(1, 2)
+        n_events = random.randint(1, 3)
 
         for _ in range(n_events):
             noise_path = random.choice(self.esc50_paths)
