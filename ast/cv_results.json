@@ -1,0 +1,54 @@
+{
+  "mean_acc": 84.748,
+  "std_acc": 1.8159,
+  "max_acc": 86.7203,
+  "min_acc": 81.7427,
+  "fold_results": [
+    {
+      "fold": 1,
+      "best_val_acc": 81.7427,
+      "model_path": "cv_models/fold_1/best_ast_genre_fold1.pth",
+      "train_size": 2400,
+      "val_size": 600,
+      "epochs": 30,
+      "time_minutes": 137.85
+    },
+    {
+      "fold": 2,
+      "best_val_acc": 83.7113,
+      "model_path": "cv_models/fold_2/best_ast_genre_fold2.pth",
+      "train_size": 2400,
+      "val_size": 600,
+      "epochs": 30,
+      "time_minutes": 96.09
+    },
+    {
+      "fold": 3,
+      "best_val_acc": 85.3659,
+      "model_path": "cv_models/fold_3/best_ast_genre_fold3.pth",
+      "train_size": 2400,
+      "val_size": 600,
+      "epochs": 30,
+      "time_minutes": 104.58
+    },
+    {
+      "fold": 4,
+      "best_val_acc": 86.7203,
+      "model_path": "cv_models/fold_4/best_ast_genre_fold4.pth",
+      "train_size": 2400,
+      "val_size": 600,
+      "epochs": 30,
+      "time_minutes": 113.23
+    },
+    {
+      "fold": 5,
+      "best_val_acc": 86.2,
+      "model_path": "cv_models/fold_5/best_ast_genre_fold5.pth",
+      "train_size": 2400,
+      "val_size": 600,
+      "epochs": 30,
+      "time_minutes": 121.59
+    }
+  ],
+  "total_time_minutes": 573.48
+}

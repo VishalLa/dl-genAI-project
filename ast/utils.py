@@ -87,27 +87,35 @@ def get_llrd_optimizer(
     weight_decay: float = 0.05
 ):
     """
-    Layer-wise Learning Rate Decay (LLRD).
-    Lower transformer layers get exponentially smaller LRs — protects
-    pretrained representations while allowing the top layers to adapt quickly.
+    Layer-wise Learning Rate Decay (LLRD) with strict parameter tracking.
     """
     param_groups = []
+    assigned_params = set()
 
-    # Classifier head — highest LR
-    param_groups.append({
-        'params': list(model.classifier.parameters()),
-        'lr': base_lr * 10,
-        'name': 'classifier'
-    })
+    # 1. Classifier head — highest LR
+    classifier_params = []
+    for n, p in model.named_parameters():
+        if "classifier" in n and p.requires_grad:
+            classifier_params.append(p)
+            assigned_params.add(p)
+    
+    if classifier_params:
+        param_groups.append({
+            'params': classifier_params,
+            'lr': base_lr * 10,
+            'name': 'classifier'
+        })
 
-    # Transformer layers — decaying LR from top (11) to bottom (0)
+    # 2. Transformer layers — decaying LR from top (11) to bottom (0)
     num_layers = 12
     for layer_idx in range(num_layers - 1, -1, -1):
         lr = base_lr * (decay_factor ** (num_layers - 1 - layer_idx))
-        layer_params = [
-            p for n, p in model.named_parameters()
-            if f"encoder.layer.{layer_idx}" in n and p.requires_grad
-        ]
+        layer_params = []
+        for n, p in model.named_parameters():
+            if f"encoder.layer.{layer_idx}." in n and p.requires_grad and p not in assigned_params:
+                layer_params.append(p)
+                assigned_params.add(p)
+        
         if layer_params:
             param_groups.append({
                 'params': layer_params,
@@ -115,16 +123,32 @@ def get_llrd_optimizer(
                 'name': f'encoder_layer_{layer_idx}'
             })
 
-    # Embeddings — lowest LR (usually kept frozen but just in case)
-    embed_params = [
-        p for n, p in model.named_parameters()
-        if 'embeddings' in n and p.requires_grad
-    ]
+    # 3. Embeddings — lowest LR
+    embed_params = []
+    for n, p in model.named_parameters():
+        if 'embeddings' in n and p.requires_grad and p not in assigned_params:
+            embed_params.append(p)
+            assigned_params.add(p)
+    
     if embed_params:
         param_groups.append({
             'params': embed_params,
             'lr': base_lr * 0.1,
             'name': 'embeddings'
+        })
+
+    # 4. Catch-all for unassigned parameters (like AST's final layernorm)
+    other_params = []
+    for n, p in model.named_parameters():
+        if p.requires_grad and p not in assigned_params:
+            other_params.append(p)
+            assigned_params.add(p)
+    
+    if other_params:
+        param_groups.append({
+            'params': other_params,
+            'lr': base_lr,
+            'name': 'other_components'
         })
 
     return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
@@ -362,6 +386,11 @@ def train_ast_model(
             grad_accum_steps = 1
             mixup_alpha = 0.4  
 
+            optimizer = torch.optim.AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=1e-3, weight_decay=1e-4
+            )
+
             total_steps = (stage2_start * len(train_loader)) // grad_accum_steps
             warmup_steps = (2 * len(train_loader)) // grad_accum_steps 
 
@@ -370,6 +399,8 @@ def train_ast_model(
                 num_warmup_steps=warmup_steps,
                 num_training_steps=total_steps
             )
+
+            scheduler.step()
 
             _print_trainable(model, epoch + 1, epochs)
             wandb.log({"stage": 1}, step=epoch)
@@ -400,6 +431,8 @@ def train_ast_model(
                 num_training_steps=n_steps
             )
 
+            scheduler.step()
+
             _print_trainable(model, epoch + 1, epochs)
             wandb.log({"stage": 2}, step=epoch)
 
@@ -416,7 +449,16 @@ def train_ast_model(
             grad_accum_steps = 4
             mixup_alpha = 0.2
 
-            model.gradient_checkpointing_enable()
+            if hasattr(model, 'ast'):
+                model.ast.gradient_checkpointing_enable()
+            elif hasattr(model, 'model'):
+                model.model.gradient_checkpointing_enable()
+            elif hasattr(model, 'encoder'):
+                model.encoder.gradient_checkpointing_enable()
+            elif hasattr(model, 'base_model'):
+                model.base_model.gradient_checkpointing_enable()
+            else:
+                print("⚠️ Warning: Could not find the internal AST model to enable gradient checkpointing. Continuing without it.")
 
             grad_accum_steps = 4
 
@@ -430,7 +472,9 @@ def train_ast_model(
                 num_warmup_steps=warmup_steps,
                 num_training_steps=n_steps
             )
-            
+
+            scheduler.step()
+
             if use_cuda:
                 torch.cuda.empty_cache()
 
@@ -709,144 +753,3 @@ def train_ast_cross_validation(
     return fold_results
 
 
-def load_ensemble(model_fn, model_paths: list, device):
-    """
-    Load multiple saved fold models into a list, ready for ensemble inference.
-
-    Args:
-        model_fn    : Zero-argument callable returning a fresh model architecture.
-        model_paths : List of .pth file paths (one per fold).
-        device      : 'cuda' or 'cpu'.
-
-    Returns:
-        models : list[nn.Module]  (all in eval mode, on device)
-    """
-
-    models = []
-    for path in model_paths: 
-        # Create a deep copy so each fold gets its own instance in memory
-        m = copy.deepcopy(model_fn).to(device) 
-        m.load_state_dict(torch.load(path, map_location=device))
-        m.eval()
-        models.append(m)
-        print(f" loaded {path}")
-
-    return models
-
-
-def ensemble_predict_chunk(
-    models: list[nn.Module],
-    spec: torch.Tensor, 
-    device: str, 
-    mode: str = "avg_prob"
-):
-    """
-    Ensemble prediction for a single spectrogram chunk.
-
-    Args:
-        models : list of loaded nn.Module models.
-        spec   : Tensor of shape [1, time, freq] or [time, freq].
-        device : 'cuda' or 'cpu'.
-        mode   : 'avg_prob'  — average softmax probabilities  (recommended)
-                 'majority'  — majority vote over argmax predictions
-
-    Returns:
-        predicted_class (int)
-    """
-
-    if spec.dim() == 2: 
-        spec = spec.unsqueeze(0)
-    spec = spec.to(device)
-
-    all_probs = []
-    all_preds = []
-
-    with torch.no_grad():
-        for model in models:
-            logits = model(spec)
-            probs = torch.softmax(logits, dim=-1)
-
-            all_probs.append(probs)
-            all_preds.append(torch.argmax(probs, dim=-1).item())
-    
-    if mode == "avg_prob":
-        avg_probs = torch.stack(all_probs).mean(dim=0)
-        return torch.argmax(avg_probs, dim=-1).item()
-    elif mode == "majority":
-        return Counter(all_preds).most_common(1)[0][0]
-    else:
-        raise ValueError(f"Unknown mode: {mode}. Use 'avg_prob' or 'majority'.")
-    
-
-def ensemble_predict_song_level(
-    models: list[nn.Module],
-    dataset_subset: Subset,
-    original_dataset: Dataset,
-    device: str,
-    chunk_mode: str = "avg_prob"
-):
-    """
-    Song-level ensemble evaluation using majority voting over chunks,
-    where each chunk prediction is itself an ensemble.
-
-    Args:
-        models          : list of loaded nn.Module models.
-        dataset_subset  : torch Subset (val split).
-        original_dataset: underlying Fast_AST_Dataset.
-        device          : 'cuda' or 'cpu'.
-        chunk_mode      : how to combine models per chunk ('avg_prob' or 'majority').
-
-    Returns:
-        song_accuracy (float)
-    """
-
-    for model in models:
-        model.eval()
-
-    song_preds = {}
-    song_labels = {}
-
-    with torch.no_grad():
-        for real_idx in dataset_subset.indices:
-            spec, label = original_dataset[real_idx]
-            label_val = label.item() if isinstance(label, torch.Tensor) else label
-
-            pred = ensemble_predict_chunk(models, spec, device, mode=chunk_mode)
-
-            song_idx = original_dataset.index_map[real_idx][0]
-            if song_idx not in song_preds:
-                song_preds[song_idx] = []
-                song_labels[song_idx] = label_val
-            song_preds[song_idx].append(pred)
-
-    correct = sum(
-        1 for sid, preds in song_preds.items()
-        if Counter(preds).most_common(1)[0][0] == song_labels[sid]
-    )
-    acc = 100.0 * correct / len(song_preds) if song_preds else 0.0
-    print(f"Ensemble song-level accuracy: {acc:.2f}%  ({correct}/{len(song_preds)} songs)")
-    return acc
-
-
-def load_ensemble_from_cv_dir(model_fn, save_dir: str, device):
-    """
-    Convenience function: auto-discovers all fold model paths from a CV save_dir
-    (reads cv_results.json) and loads them into an ensemble.
-
-    Args:
-        model_fn : Zero-argument callable returning fresh model architecture.
-        save_dir : Directory passed to train_ast_cross_validation.
-        device   : 'cuda' or 'cpu'.
-
-    Returns:
-        models (list[nn.Module]), cv_summary (dict)
-    """
-    results_path = os.path.join(save_dir, "cv_results.json")
-    with open(results_path) as f:
-        cv_summary = json.load(f)
-
-    model_paths = [r["model_path"] for r in cv_summary["fold_results"]]
-
-    print(f"Loading {len(model_paths)}-model ensemble from {save_dir} ...")
-    models = load_ensemble(model_fn, model_paths, device)
-    return models, cv_summary

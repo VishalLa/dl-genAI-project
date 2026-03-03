@@ -1,0 +1,11 @@
+{
+    "models_paths": {
+        "model_1": "models\\best_ast_genre_1.pth",
+        "model_2": "models\\best_ast_genre_2.pth",
+        "model_3": "models\\best_ast_genre_3.pth",
+        "model_4": "models\\best_ast_genre_4.pth",
+        "model_5": "models\\best_ast_genre_5.pth",
+        "model_6": "models\\best_ast_genre_score(0.82).pth",
+        "model_7": "models\\best_ast_genre_score(0.839).pth"
+    }
+}
