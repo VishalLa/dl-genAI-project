@@ -26,7 +26,8 @@ class Fast_AST_Dataset(Dataset):
         self._load_files()
 
         mode = "train" if train else "val"
-        print(f"[{mode}] Loaded {len(self.samples)} pre-computed spectrogram chunks.")
+        n_songs = len({s for s, _ in self.index_map})
+        print(f"[{mode}] {len(self.samples)} chunks from {n_songs} songs | {len(self.class_map)} classes")
 
     def _load_files(self):
         """
@@ -34,6 +35,7 @@ class Fast_AST_Dataset(Dataset):
         """
 
         global_song_counter = 0
+        self.song_chunk_counts: dict[int, int] = {}
 
         # iterate over upper dir like blue, classical etc
         for label_id, genre_dir in enumerate(sorted(self.data_dir.iterdir())):
@@ -52,22 +54,34 @@ class Fast_AST_Dataset(Dataset):
             if len(chunk_paths) == 0:
                 continue
 
-            chunks_per_song = 3  # matches pre_compute_spec.py (10.24s * 3 ~ 30s song)
+            prev_chunk_num = None
+            local_song_idx = 0
+            chunk_idx_within = 0
 
             for chunk_path in chunk_paths:
-                chunk_num = int(chunk_path.stem.split('_')[1])
-                # local song index within this genre
-                local_song_idx = chunk_num // chunks_per_song
-                # global unique song index across all genres
+                chunk_num = int(chunk_path.stem.split("_")[1])
+
+                # Gap in numbering or first chunk -> new song
+                if prev_chunk_num is None or chunk_num != prev_chunk_num + 1:
+                    if prev_chunk_num is not None:
+                        local_song_idx += 1
+                    chunk_idx_within = 0
+
                 global_song_idx = global_song_counter + local_song_idx
 
                 self.samples.append(chunk_path)
                 self.labels.append(label_id)
-                self.index_map.append((global_song_idx, chunk_num))
+                self.index_map.append((global_song_idx, chunk_idx_within))
 
-            max_chunk = int(chunk_paths[-1].stem.split('_')[1])
-            n_songs_this_genre = (max_chunk // chunks_per_song) + 1
-            global_song_counter += n_songs_this_genre
+                # Track how many chunks this song has
+                self.song_chunk_counts[global_song_idx] = (
+                    self.song_chunk_counts.get(global_song_idx, 0) + 1
+                )
+
+                prev_chunk_num   = chunk_num
+                chunk_idx_within += 1
+
+            global_song_counter += local_song_idx + 1
 
     @staticmethod
     def spec_augment(spec: torch.Tensor) -> torch.Tensor:
@@ -112,15 +126,13 @@ class Fast_AST_Dataset(Dataset):
 def fast_collate_fn(batch):
     """
     Collate pre-computed spectrograms into a batched tensor.
-    Input:  list of (spectrogram [1024, 128], label)
-    Output: (batch [B, 1024, 128], labels [B])
+
+    Input  : list of (spectrogram [1024, 128], label)
+    Output : (batch_spectrograms [B, 1024, 128], batch_labels [B])
     """
-    spectrograms = [item[0] for item in batch]
-    labels = [item[1] for item in batch]
-
-    batched_spectrograms = torch.stack(spectrograms, dim=0)
-
-    clean_labels = [l.item() if isinstance(l, torch.Tensor) else l for l in labels]
-    batched_labels = torch.tensor(clean_labels, dtype=torch.long)
-
-    return batched_spectrograms, batched_labels
+    spectrograms = torch.stack([item[0] for item in batch], dim=0)
+    labels = torch.tensor(
+        [l.item() if isinstance(l, torch.Tensor) else l for l in [item[1] for item in batch]],
+        dtype=torch.long,
+    )
+    return spectrograms, labels

@@ -14,6 +14,11 @@ from utils import highpass_filter
 
 from helper.golbal_variables import *
 
+
+SAMPLE_RATE = 16000
+CHUNK_DURATION = 10.24
+
+
 class AST_Audio_DataLoader(Dataset):
 
     """
@@ -24,13 +29,22 @@ class AST_Audio_DataLoader(Dataset):
     - Converts to mono and resamples to 16kHz
     - Applies high-pass filtering
     - Merges stems into a single waveform
-    - Splits audio into 10.24-second chunks (1024 spectrogram frames)
-    - Optionally injects ESC-50 environmental noise
-    - Normalizes waveform
-    - Returns 1D waveform + label
+    - 8-second chunks  (128 000 samples @ 16 kHz)
+      - ESC-50 noise injection with two modes:
+          * BACKGROUND  — noise sits quietly behind the music  (SNR 18–35 dB)
+          * FOREGROUND  — noise is clearly audible / overpowers music (SNR 2–10 dB)
+        35% of injected events are foreground, 65% are background.
 
     Each song may generate multiple training samples (chunks).
     """
+
+    # ESC-50 noise injection probabilities
+    ESC50_INJECT_PROB = 0.65   # chance any chunk gets noise at all
+    ESC50_FG_PROB = 0.35   # of injected chunks: chance noise is FOREGROUND
+
+    # SNR ranges (dB)  — higher SNR = quieter noise relative to music
+    BG_SNR_RANGE = (18, 35)    # background: barely audible
+    FG_SNR_RANGE = (2,  10)    # foreground: clearly audible / overpowers music
 
     def __init__(self, genre_dir: Path, esc50_dir: Path):
 
@@ -42,16 +56,15 @@ class AST_Audio_DataLoader(Dataset):
 
         self.genre_dir = genre_dir
         self.esc50_paths = list(esc50_dir.rglob("*.wav"))
-
-        self.SAMPLE_RATE = 16000
         
-        # AST is optimized for 10.24 seconds (exactly 1024 spectrogram frames)
-        self.CHUNK_DURATION = 10.24 
-        self.CHUNK_SAMPLES = int(self.SAMPLE_RATE * self.CHUNK_DURATION)
+        self.SAMPLE_RATE = SAMPLE_RATE 
+        self.CHUNK_DURATION = CHUNK_DURATION
+        self.CHUNK_SAMPLES  = int(self.SAMPLE_RATE * self.CHUNK_DURATION)
 
         self.samples = []
         self.labels = []
         self.class_map = {}
+        self.index_map = []
 
         self._load_files()
         self._build_index_map()
@@ -98,29 +111,27 @@ class AST_Audio_DataLoader(Dataset):
     def _build_index_map(self):
 
         """
-        Builds an index mapping from dataset index → (song_index, chunk_start_sample).
-
-        Each song is divided into multiple 10.24-second chunks.
-        This allows each chunk to act as an independent training sample.
+        Pre-compute (song_idx, start_sample) for every 8-second chunk
+        across all songs. Overlapping is NOT used — clean non-overlapping grid.
         """
-
-        self.index_map = []
-        for song_idx in range(len(self.samples)):
-            waveform, sr = torchaudio.load(self.samples[song_idx][0])
+        for song_idx, wave_parts in enumerate(tqdm(self.samples)):
+            waveform, sr = torchaudio.load(wave_parts[0])
             waveform = waveform.mean(dim=0, keepdim=True)
 
             if sr != self.SAMPLE_RATE:
-                resampler = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)
-                waveform = resampler(waveform)
+                waveform = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)(waveform)
 
-            total_len = waveform.shape[1]
-            n_chunks = (total_len + self.CHUNK_SAMPLES - 1) // self.CHUNK_SAMPLES
+            # for multi-part songs, estimate totlat length from part count 
+            part_len = waveform.shape[1]
+            est_total = part_len * len(wave_parts)
 
+            n_chunks = max(1, est_total // self.CHUNK_SAMPLES)
             for c in range(n_chunks):
-                start = c * self.CHUNK_SAMPLES
-                self.index_map.append((song_idx, start))
+                self.index_map.append((song_idx, c * self.CHUNK_SAMPLES))
 
-        print("Total training segments:", len(self.index_map))
+        print(f"Total chunks : {len(self.index_map)}")
+        print(f"Total songs  : {len(self.samples)}")
+        print(f"Classes      : {list(self.class_map.keys())}")
 
     def __len__(self):
         """Returns total number of audio chunks in dataset."""
@@ -140,17 +151,7 @@ class AST_Audio_DataLoader(Dataset):
             waveform = highpass_filter(waveform, sample_rate=self.SAMPLE_RATE)
             waveforms.append(waveform)
 
-        max_len = max(w.shape[1] for w in waveforms)
-        padded = []
-
-        for w in waveforms:
-            if w.shape[1] < max_len:
-                w = torch.nn.functional.pad(w, (0, max_len - w.shape[1]))
-
-            padded.append(w)
-
-        full_waveform = torch.stack(padded, dim=0).mean(dim=0)
-        return full_waveform
+        return torch.cat(waveforms, dim=1)
 
     def get_chunk(self, waveform: torch.Tensor, start: int):
 
@@ -176,51 +177,78 @@ class AST_Audio_DataLoader(Dataset):
             chunk = waveform[:, start:end]
 
         return chunk
+    
 
-    def inject_esc50_noise(self, music_waveform):
-
+    def _load_noise(self, target_len: int) -> torch.Tensor:
         """
-        Randomly injects environmental noise from ESC-50 dataset.
-
-        - 20% probability of skipping injection
-        - Random 1–2 noise events
-        - Random SNR between 8–18 dB
-
-        Args:
-            music_waveform (torch.Tensor): Clean music waveform
-
-        Returns:
-            torch.Tensor: Augmented waveform
+        Load a random ESC-50 clip, resample, and fit it to target_len samples.
+        Short clips are tiled; long clips are randomly cropped.
         """
 
-        if random.random() > 0.8:
+        noise_path = random.choice(self.esc50_paths)
+        noise, sr = torchaudio.load(noise_path)
+
+        if sr != self.SAMPLE_RATE:
+            noise = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)(noise)
+
+        noise_len = noise.shape[1]
+
+        if noise_len < target_len:
+            # Tile the short clip to fill the required length
+            repeats = (target_len // noise_len) + 1
+            noise = noise.repeat(1, repeats)
+
+        # Random crop to exactly target_len
+        max_start = noise.shape[1] - target_len
+        start = random.randint(0, max_start)
+        return noise[:, start : start + target_len]
+
+
+    def inject_esc50_noise(self, music_waveform: torch.Tensor) -> torch.Tensor:
+
+        """
+        Inject ESC-50 environmental noise into the music chunk.
+
+        Two modes chosen randomly per event:
+          BACKGROUND (65% of events) — low volume, noise barely noticeable
+              SNR range: 18–35 dB  → noise is ~8–56× quieter than music
+          FOREGROUND (35% of events) — noise clearly audible, can overpower
+              SNR range: 2–10 dB   → noise is ~0.4–3× the music level
+
+        Overall injection probability: ESC50_INJECT_PROB (0.65)
+        Number of simultaneous events: 1–3
+        """
+
+        if not self.esc50_paths or random.random() > self.ESC50_INJECT_PROB:
             return music_waveform
-        
-        samples = music_waveform.shape[1]
+
+        chunk_len = music_waveform.shape[1]
         n_events = random.randint(1, 3)
 
         for _ in range(n_events):
-            noise_path = random.choice(self.esc50_paths)
-            noise_wave, sr = torchaudio.load(noise_path)
-            noise_wave = noise_wave.mean(dim=0, keepdim=True)
+            noise = self._load_noise(chunk_len)   # [1, chunk_len]
 
-            if sr != self.SAMPLE_RATE:
-                resampler = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)
-                noise_wave = resampler(noise_wave)
+            # Decide foreground vs background for this individual event
+            is_foreground = random.random() < self.ESC50_FG_PROB
+            snr_range = self.FG_SNR_RANGE if is_foreground else self.BG_SNR_RANGE
+            snr_db = random.uniform(*snr_range)
 
-            noise_len = noise_wave.shape[1]
-            if noise_len >= samples:
-                noise_wave = noise_wave[:, :samples]
-                start = 0
-            else:
-                start = random.randint(0, samples - noise_len)
-
-            snr_db = random.uniform(8, 18)
-            music_power = music_waveform.pow(2).mean()
-            noise_power = noise_wave.pow(2).mean() + 1e-9
-
+            # Compute power-based scale factor
+            music_power = music_waveform.pow(2).mean().clamp(min=1e-9)
+            noise_power = noise.pow(2).mean().clamp(min=1e-9)
             scale = torch.sqrt(music_power / (noise_power * (10 ** (snr_db / 10))))
-            music_waveform[:, start:start+noise_len] += scale * noise_wave
+
+            # For foreground events, optionally place noise at a random time offset
+            # so it sounds like something "happening" rather than constant background
+            if is_foreground:
+                event_len = int(chunk_len * random.uniform(0.3, 1.0))
+                offset = random.randint(0, chunk_len - event_len)
+                music_waveform[:, offset : offset + event_len] += (
+                    scale * noise[:, :event_len]
+                )
+            else:
+                # Background: mix across entire chunk at low volume
+                music_waveform = music_waveform + scale * noise
 
         return music_waveform
 
@@ -281,50 +309,60 @@ def collate_fn(batch):
     return inputs.input_values, labels
 
 
-def precompute_ast_dataset(genre_path: Path, esc50_path: Path, output_path: Path):
-    print("Initializing original dataset (this might take a second)...")
-    original_dataset = AST_Audio_DataLoader(genre_dir=genre_path, esc50_dir=esc50_path)
-    
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Create genre subfolders
-    id2genre = {v: k for k, v in original_dataset.class_map.items()}
-    for genre in original_dataset.class_map.keys():
-        (output_path / genre).mkdir(exist_ok=True)
+def precompute_ast_dataset(genre_dir: Path, esc50_dir: Path, output_dir: Path, n_augment_passes: int = 1):
+    """
+    Pre-compute and save AST spectrograms to disk.
 
-    # Load the AST Extractor
-    feature_extractor = ASTFeatureExtractor.from_pretrained(
-        "MIT/ast-finetuned-audioset-10-10-0.4593"
-    )
+    Each chunk is saved as a .pt file containing (spectrogram [1024,128], label).
 
-    print(f"\nProcessing and saving {len(original_dataset)} spectrograms...")
-    
-    for i in tqdm(range(len(original_dataset))):
-        
-        # 1. Get the complex merged/filtered/noisy 1D waveform from your class
-        waveform, label = original_dataset[i]
-        genre_name = id2genre[label.item()]
-        
-        # 2. Convert to AST 2D Spectrogram
-        inputs = feature_extractor(
-            waveform.numpy(),
-            sampling_rate=16000,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        
-        # Remove the batch dimension so shape is exactly [1024, 128]
-        spectrogram = inputs.input_values.squeeze(0) 
-        
-        # 3. Save the tensor and label directly to disk
-        save_file = output_path / genre_name / f"chunk_{i}.pt"
-        torch.save((spectrogram, label), save_file)
+    Args:
+        genre_path      : Root directory of genre folders.
+        esc50_path      : Root directory of ESC-50 wav files.
+        output_path     : Where to save .pt spectrogram files.
+        n_augment_passes: How many times to iterate the dataset with different
+                          random noise seeds (data multiplication).
+                          1 = no duplication, 2 = 2× data, etc.
+    """
+    print("Initializing dataset ...")
+    dataset = AST_Audio_DataLoader(genre_dir=genre_dir, esc50_dir=esc50_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nDone! All data saved to: {output_path.absolute()}")
+    # Create per-genre subfolders
+    id2genre = {v: k for k, v in dataset.class_map.items()}
+    for genre in dataset.class_map:
+        (output_dir / genre).mkdir(exist_ok=True)
+
+    total = len(dataset) * n_augment_passes
+    print(f"\nSaving {total} spectrograms  "
+          f"({len(dataset)} chunks × {n_augment_passes} augment pass(es)) ...")
+    print(f"Chunk duration : {CHUNK_DURATION:.2f} s  ({int(SAMPLE_RATE * CHUNK_DURATION)} samples)")
+
+    global_idx = 0
+    for pass_idx in range(n_augment_passes):
+        desc = f"Pass {pass_idx + 1}/{n_augment_passes}"
+        for i in tqdm(range(len(dataset)), desc=desc):
+            waveform, label = dataset[i]
+            genre_name = id2genre[label.item()]
+
+            inputs = feature_extractor(
+                waveform.numpy(),
+                sampling_rate=SAMPLE_RATE,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            spectrogram = inputs.input_values.squeeze(0)  # [1024, 128]
+
+            save_path = output_dir / genre_name / f"chunk_{global_idx:06d}.pt"
+            torch.save((spectrogram, label), save_path)
+            global_idx += 1
+
+    print(f"\nDone! {global_idx} files saved to: {output_dir.absolute()}")
+    print(f"Class map: {dataset.class_map}")
 
 
 precompute_ast_dataset(
     genre_dir=GENRES_STEMS, 
     esc50_dir=ESC_50_MASTER, 
-    output_dir=GENRES_PT
+    output_dir=GENRES_PT,
+    n_augment_passes=1
 )

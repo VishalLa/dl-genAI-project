@@ -364,8 +364,8 @@ def train_ast_model(
     best_val_loss = float('inf')
 
     # Stage boundaries — 30 / 50 / 20 split
-    stage2_start = int(epochs * 0.30)
-    stage3_start = int(epochs * 0.80)
+    stage2_start = int(epochs * 0.20)
+    stage3_start = int(epochs * 0.65)
 
     optimizer = None
     scheduler = None
@@ -388,7 +388,7 @@ def train_ast_model(
 
             optimizer = torch.optim.AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
-                lr=1e-3, weight_decay=1e-4
+                lr=1e-3, weight_decay=0.05
             )
 
             total_steps = (stage2_start * len(train_loader)) // grad_accum_steps
@@ -399,8 +399,6 @@ def train_ast_model(
                 num_warmup_steps=warmup_steps,
                 num_training_steps=total_steps
             )
-
-            scheduler.step()
 
             _print_trainable(model, epoch + 1, epochs)
             wandb.log({"stage": 1}, step=epoch)
@@ -419,7 +417,7 @@ def train_ast_model(
 
             optimizer = torch.optim.AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
-                lr=5e-5, weight_decay=1e-4
+                lr=5e-5, weight_decay=0.05
             )
 
             n_steps = ((stage3_start - stage2_start) * len(train_loader)) // grad_accum_steps
@@ -430,8 +428,6 @@ def train_ast_model(
                 num_warmup_steps=warmup_steps,
                 num_training_steps=n_steps
             )
-
-            scheduler.step()
 
             _print_trainable(model, epoch + 1, epochs)
             wandb.log({"stage": 2}, step=epoch)
@@ -473,8 +469,6 @@ def train_ast_model(
                 num_training_steps=n_steps
             )
 
-            scheduler.step()
-
             if use_cuda:
                 torch.cuda.empty_cache()
 
@@ -492,7 +486,8 @@ def train_ast_model(
             use_mixup=use_mixup,
             mixup_alpha=mixup_alpha,
             scaler=scaler, 
-            grad_accum_steps=grad_accum_steps
+            grad_accum_steps=grad_accum_steps,
+            scheduler=scheduler
         )
         val_loss, val_acc_chunk = test_ast(
             model=model, 
@@ -578,22 +573,16 @@ def train_single_corss_validation(
     if use_cuda:
         torch.cuda.empty_cache()
 
-    wandb.init(
-        project="ast-genre-classification-signel-run",
-        name="3-stage-v4-mixup-specaug-amp",
+    run = wandb.init(
+        project="ast-genre-classification",
+        name="single-run",
         config={
-            "epochs": epochs,
+            "epochs": epochs, 
             "optimizer": "AdamW",
-            "mixup_alpha": 0.4,
-            "label_smoothing": 0.1,
-            "spec_augment": True,
-            "amp": use_cuda,
-            "grad_checkpointing_stage3": True,
-            "grad_accum_stage3": 4,
-            "scheduler": "CosineAnnealingLR",
-            "dataset": "Genre",
+            "label_smoothing": 0.1, 
+            "amp": device == "cuda",
+            "scheduler": "cosine-with-warmup",
             "architecture": model.__class__.__name__,
-            "base_model": "ast-finetuned-audioset-10-10-0.4593",
         }
     )
     wandb.watch(model, log="all", log_freq=50)
@@ -603,14 +592,14 @@ def train_single_corss_validation(
     save_path = os.path.join(save_dir, "best_ast_genre.pth")
 
     best_acc = train_ast_model(
-        model=model,
+        model=model, 
         device=device,
-        train_loader=train_loader,
+        train_loader=train_loader, 
         val_loader=val_loader,
-        original_dataset=original_dataset,
-        val_dataset_subset=val_dataset_subset,
         save_path=save_path,
-        epochs=epochs
+        val_dataset_subset=val_dataset_subset,
+        original_dataset=original_dataset,
+        epochs=epochs, 
     )
 
     wandb.finish()
@@ -618,14 +607,14 @@ def train_single_corss_validation(
 
 
 def train_ast_cross_validation(
-    model_fn: nn.Module,
+    model_fn,
     device: str,
     full_dataset: Subset,
     train_loader: DataLoader,
     val_loader: DataLoader,
     n_folds: int = 5, 
     epochs: int = 30,
-    save_dir: str = "cv_models",
+    save_dir: str = "cv_models_ast",
     wandb_project: str = "ast-genre-classification-cross-validation",
 ):
     """
@@ -648,7 +637,7 @@ def train_ast_cross_validation(
     skf = StratifiedKFold(
         n_splits=n_folds,
         shuffle=True,
-        random_state=42
+        random_state=2
     )
 
     fold_results = []
@@ -681,15 +670,17 @@ def train_ast_cross_validation(
         train_subset = Subset(full_dataset, train_idx)
         val_subset   = Subset(full_dataset, val_idx)
 
-        model = model_fn.to(device)
+        model = model_fn().to(device)
 
         run = wandb.init(
             project=wandb_project,
             name=f"fold-{fold_num}-of-{n_folds}",
             group="cross-validation",
             config={
-                "fold": fold_num, "n_folds": n_folds,
-                "epochs": epochs, "optimizer": "AdamW",
+                "fold": fold_num, 
+                "n_folds": n_folds,
+                "epochs": epochs, 
+                "optimizer": "AdamW",
                 "label_smoothing": 0.1,
                 "scheduler": "cosine-with-warmup",
                 "architecture": model.__class__.__name__,
@@ -699,15 +690,15 @@ def train_ast_cross_validation(
 
         fold_start = time.time()
 
-        best_acc = train_single_corss_validation(
-            model=model,
-            train_loader=train_loader,
+        best_acc = train_ast_model(
+            model=model, 
+            device=device,
+            train_loader=train_loader, 
             val_loader=val_loader,
+            save_path=save_path,
             val_dataset_subset=val_subset,
             original_dataset=full_dataset,
-            epochs=epochs,
-            save_dir=save_path,
-            device=device
+            epochs=epochs, 
         )
 
         fold_time = time.time() - fold_start
