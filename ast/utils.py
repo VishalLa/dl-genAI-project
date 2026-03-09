@@ -16,8 +16,6 @@ from sklearn.model_selection import StratifiedKFold
 from transformers import get_cosine_schedule_with_warmup
 from collections import Counter
 
-from helper.golbal_variables import *
-
 
 def highpass_filter(
     audio: torch.Tensor, 
@@ -326,73 +324,59 @@ def test_ast_song_level(
 
 
 def train_ast_model(
-    model: nn.Module, 
-    device: str, 
-    train_loader: DataLoader, 
+    model: nn.Module,
+    device: str,
+    train_loader: DataLoader,
     val_loader: DataLoader,
-    save_path: str, 
-    val_dataset_subset: Subset=None, 
-    original_dataset: Subset=None,
-    epochs: int=30
+    save_path: str,
+    val_dataset_subset: Subset = None,
+    original_dataset: Dataset = None,
+    epochs: int = 30
 ):
-    
-    """
-    Trains one model with the 3-stage progressive unfreezing strategy.
 
-      - weight_decay 1e-4 → 0.05  (proper transformer regularisation)
-      - LR warmup added to every stage  (prevents instability)
-      - Stage 2 unfreezes layers 6-11 + layernorm  (was 8-11 only)
-      - Stage 3 uses LLRD instead of flat LR
-      - Scheduler stepped per-batch (required for warmup)
-      - Mixup active from epoch 0 (not just stage 2+)
-      - Stage boundaries: 20 / 65 split  (more time for full fine-tune)
-    """
-
-    use_cuda = (device == "cuda")
+    use_cuda = device == "cuda"
     if use_cuda:
         torch.cuda.empty_cache()
 
-    # AMP scaler — only meaningful on CUDA
     scaler = GradScaler() if use_cuda else None
-
     model = model.to(device)
 
     loss_function = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     start_time = time.time()
     best_val_acc = 0.0
-    best_val_loss = float('inf')
+    best_val_loss = float("inf")
 
-    # Stage boundaries — 30 / 50 / 20 split
-    stage2_start = int(epochs * 0.20)
-    stage3_start = int(epochs * 0.65)
+    stage2_start = int(epochs * 0.30)
+    stage3_start = int(epochs * 0.80)
 
     optimizer = None
     scheduler = None
-    grad_accum_steps = 1   
-    mixup_alpha = 0.4       
+    grad_accum_steps = 1
+    mixup_alpha = 0.4
 
     for epoch in range(epochs):
+
         epoch_start = time.time()
 
         if epoch == 0:
-            print(f"STAGE 1: Classifier head only  (lr=1e-3, epochs 1-{stage2_start})")
+
+            print(f"STAGE 1: Classifier head only (lr=1e-3)")
 
             for param in model.parameters():
                 param.requires_grad = False
+
             for param in model.classifier.parameters():
                 param.requires_grad = True
 
-            grad_accum_steps = 1
-            mixup_alpha = 0.4  
-
             optimizer = torch.optim.AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
-                lr=1e-3, weight_decay=0.05
+                lr=1e-3,
+                weight_decay=1e-4
             )
 
-            total_steps = (stage2_start * len(train_loader)) // grad_accum_steps
-            warmup_steps = (2 * len(train_loader)) // grad_accum_steps 
+            total_steps = stage2_start * len(train_loader)
+            warmup_steps = 2 * len(train_loader)
 
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer,
@@ -401,27 +385,32 @@ def train_ast_model(
             )
 
             _print_trainable(model, epoch + 1, epochs)
-            wandb.log({"stage": 1}, step=epoch)
 
         elif epoch == stage2_start:
-            print(f"\n{'=' * 70}")
-            print(f"STAGE 2: Layers 8-11 unfrozen  (lr=5e-5, epochs {stage2_start+1}-{stage3_start})")
+
+            print(f"\n{'='*60}")
+            print("STAGE 2: Unfreeze encoder layers 6-11")
 
             for name, param in model.named_parameters():
-                for layer in ["encoder.layer.6", "encoder.layer.7", "encoder.layer.8", "encoder.layer.9", "encoder.layer.10", "encoder.layer.11","layernorm"]:
-                    if layer in name:
-                        param.requires_grad = True
-
-            grad_accum_steps = 1
-            mixup_alpha = 0.2  
+                if any(layer in name for layer in [
+                    "encoder.layer.6",
+                    "encoder.layer.7",
+                    "encoder.layer.8",
+                    "encoder.layer.9",
+                    "encoder.layer.10",
+                    "encoder.layer.11",
+                    "layernorm"
+                ]):
+                    param.requires_grad = True
 
             optimizer = torch.optim.AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
-                lr=5e-5, weight_decay=0.05
+                lr=5e-5,
+                weight_decay=1e-4
             )
 
-            n_steps = ((stage3_start - stage2_start) * len(train_loader)) // grad_accum_steps
-            warmup_steps = (1 * len(train_loader)) // grad_accum_steps
+            n_steps = (stage3_start - stage2_start) * len(train_loader)
+            warmup_steps = len(train_loader)
 
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer,
@@ -430,14 +419,12 @@ def train_ast_model(
             )
 
             _print_trainable(model, epoch + 1, epochs)
-            wandb.log({"stage": 2}, step=epoch)
 
         elif epoch == stage3_start:
-            print(f"\n{'=' * 70}")
-            print(f"STAGE 3: Full fine-tune  (lr=1e-5, epochs {stage3_start+1}-{epochs})")
-            print(f"         [AMP + gradient checkpointing + grad accum x4]")
 
-            # Unfreeze everything except embeddings
+            print(f"\n{'='*60}")
+            print("STAGE 3: Full Fine-tune")
+
             for name, param in model.named_parameters():
                 if "embeddings" not in name:
                     param.requires_grad = True
@@ -445,23 +432,10 @@ def train_ast_model(
             grad_accum_steps = 4
             mixup_alpha = 0.2
 
-            if hasattr(model, 'ast'):
-                model.ast.gradient_checkpointing_enable()
-            elif hasattr(model, 'model'):
-                model.model.gradient_checkpointing_enable()
-            elif hasattr(model, 'encoder'):
-                model.encoder.gradient_checkpointing_enable()
-            elif hasattr(model, 'base_model'):
-                model.base_model.gradient_checkpointing_enable()
-            else:
-                print("⚠️ Warning: Could not find the internal AST model to enable gradient checkpointing. Continuing without it.")
+            optimizer = get_llrd_optimizer(model, base_lr=1e-5)
 
-            grad_accum_steps = 4
-
-            optimizer = get_llrd_optimizer(model, base_lr=1e-5, decay_factor=0.65)
-            
-            n_steps = ((epochs - stage3_start) * len(train_loader)) // grad_accum_steps
-            warmup_steps = (1 * len(train_loader)) // grad_accum_steps
+            n_steps = (epochs - stage3_start) * len(train_loader) // grad_accum_steps
+            warmup_steps = len(train_loader) // grad_accum_steps
 
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer,
@@ -473,37 +447,39 @@ def train_ast_model(
                 torch.cuda.empty_cache()
 
             _print_trainable(model, epoch + 1, epochs)
-            wandb.log({"stage": 3}, step=epoch)
 
-        use_mixup = (epoch >= stage2_start)
+        use_mixup = epoch >= stage2_start
 
         train_loss, train_acc = train_ast(
             model=model,
-            dataloader=train_loader, 
-            loss_function=loss_function, 
-            optimizer=optimizer, 
+            dataloader=train_loader,
+            loss_function=loss_function,
+            optimizer=optimizer,
             device=device,
             use_mixup=use_mixup,
             mixup_alpha=mixup_alpha,
-            scaler=scaler, 
+            scaler=scaler,
             grad_accum_steps=grad_accum_steps,
             scheduler=scheduler
         )
+
         val_loss, val_acc_chunk = test_ast(
-            model=model, 
-            dataloader=val_loader, 
-            loss_function=loss_function, 
+            model=model,
+            dataloader=val_loader,
+            loss_function=loss_function,
             device=device
         )
 
         # Song-level majority vote (only if caller provides the subset + dataset)
         val_acc_song = None
-        # if val_dataset_subset is not None and original_dataset is not None:
-        val_acc_song = test_ast_song_level(
-            model=model,
-            dataset_subset=val_dataset_subset, original_dataset=original_dataset, 
-            device=device
-        )
+        if val_dataset_subset is not None and original_dataset is not None:
+
+            val_acc_song = test_ast_song_level(
+                model=model,
+                dataset_subset=val_dataset_subset,
+                original_dataset=original_dataset,
+                device=device
+            )
 
 
         epoch_time = time.time() - epoch_start
@@ -516,43 +492,46 @@ def train_ast_model(
             "val_loss": val_loss,
             "val_accuracy_chunk": val_acc_chunk,
             "learning_rate": current_lr,
-            "epoch_time": epoch_time,
+            "epoch_time": epoch_time
         }
+
         if val_acc_song is not None:
             log_dict["val_accuracy_song"] = val_acc_song
 
         wandb.log(log_dict)
 
-        song_str = f" | Song Acc: {val_acc_song:6.2f}%" if val_acc_song is not None else ""
+        song_str = f" | Song Acc: {val_acc_song:.2f}%" if val_acc_song else ""
+
         print(
-            f"Epoch [{epoch+1:3d}/{epochs}] | "
-            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:6.2f}% | "
-            f"Val Loss: {val_loss:.4f} | Chunk Acc: {val_acc_chunk:6.2f}%"
+            f"Epoch [{epoch+1}/{epochs}] | "
+            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | "
+            f"Val Loss: {val_loss:.4f} | Chunk Acc: {val_acc_chunk:.2f}%"
             f"{song_str} | LR: {current_lr:.2e} | Time: {epoch_time:.1f}s"
         )
 
-        # Save on best chunk-level val acc (or song-level if available)
         primary_acc = val_acc_song if val_acc_song is not None else val_acc_chunk
 
         if primary_acc > best_val_acc:
             best_val_acc = primary_acc
             best_val_loss = val_loss
+
             torch.save(model.state_dict(), save_path)
+
             metric_name = "song" if val_acc_song is not None else "chunk"
-            print(f"    ✓ Saved [{metric_name}: {primary_acc:.2f}%]  →  {save_path}")
+
+            print(f"✓ Saved best model [{metric_name}: {primary_acc:.2f}%] → {save_path}")
 
     total_time = time.time() - start_time
 
-    print(f"\n{'=' * 70}")
-    print(f"AST TRAINING COMPLETE  (v2)")
-    print(f"{'=' * 70}")
-    print(f"Total Training Time    : {total_time / 60:.1f} minutes")
-    print(f"Best Validation Acc    : {best_val_acc:.2f}%")
-    print(f"Best Validation Loss   : {best_val_loss:.4f}")
-    print(f"Model saved as         : best_ast_genre.pth")
-    print(f"{'=' * 70}\n")
+    print("\n" + "=" * 60)
+    print("AST TRAINING COMPLETE")
+    print("=" * 60)
+    print(f"Total Training Time : {total_time/60:.1f} minutes")
+    print(f"Best Validation Acc : {best_val_acc:.2f}%")
+    print("=" * 60)
 
     wandb.finish()
+
     return best_val_acc
 
 def train_single_corss_validation(
@@ -573,16 +552,22 @@ def train_single_corss_validation(
     if use_cuda:
         torch.cuda.empty_cache()
 
-    run = wandb.init(
-        project="ast-genre-classification",
-        name="single-run",
+    wandb.init(
+        project="ast-genre-classification-signel-run",
+        name="3-stage-v4-mixup-specaug-amp",
         config={
-            "epochs": epochs, 
+            "epochs": epochs,
             "optimizer": "AdamW",
-            "label_smoothing": 0.1, 
-            "amp": device == "cuda",
-            "scheduler": "cosine-with-warmup",
+            "mixup_alpha": 0.4,
+            "label_smoothing": 0.1,
+            "spec_augment": True,
+            "amp": use_cuda,
+            "grad_checkpointing_stage3": True,
+            "grad_accum_stage3": 4,
+            "scheduler": "CosineAnnealingLR",
+            "dataset": "Genre",
             "architecture": model.__class__.__name__,
+            "base_model": "ast-finetuned-audioset-10-10-0.4593",
         }
     )
     wandb.watch(model, log="all", log_freq=50)
@@ -592,14 +577,14 @@ def train_single_corss_validation(
     save_path = os.path.join(save_dir, "best_ast_genre.pth")
 
     best_acc = train_ast_model(
-        model=model, 
+        model=model,
         device=device,
-        train_loader=train_loader, 
+        train_loader=train_loader,
         val_loader=val_loader,
-        save_path=save_path,
-        val_dataset_subset=val_dataset_subset,
         original_dataset=original_dataset,
-        epochs=epochs, 
+        val_dataset_subset=val_dataset_subset,
+        save_path=save_path,
+        epochs=epochs,
     )
 
     wandb.finish()
@@ -614,7 +599,7 @@ def train_ast_cross_validation(
     val_loader: DataLoader,
     n_folds: int = 5, 
     epochs: int = 30,
-    save_dir: str = "cv_models_ast",
+    save_dir: str = "cv_models",
     wandb_project: str = "ast-genre-classification-cross-validation",
 ):
     """
@@ -637,7 +622,7 @@ def train_ast_cross_validation(
     skf = StratifiedKFold(
         n_splits=n_folds,
         shuffle=True,
-        random_state=2
+        random_state=42
     )
 
     fold_results = []
@@ -677,10 +662,8 @@ def train_ast_cross_validation(
             name=f"fold-{fold_num}-of-{n_folds}",
             group="cross-validation",
             config={
-                "fold": fold_num, 
-                "n_folds": n_folds,
-                "epochs": epochs, 
-                "optimizer": "AdamW",
+                "fold": fold_num, "n_folds": n_folds,
+                "epochs": epochs, "optimizer": "AdamW",
                 "label_smoothing": 0.1,
                 "scheduler": "cosine-with-warmup",
                 "architecture": model.__class__.__name__,
@@ -690,15 +673,31 @@ def train_ast_cross_validation(
 
         fold_start = time.time()
 
-        best_acc = train_ast_model(
-            model=model, 
-            device=device,
-            train_loader=train_loader, 
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=train_loader.batch_size,
+            shuffle=True,
+            num_workers=train_loader.num_workers,
+            pin_memory=True
+        )
+
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=val_loader.batch_size,
+            shuffle=False,
+            num_workers=val_loader.num_workers,
+            pin_memory=True
+        )
+
+        best_acc = train_single_corss_validation(
+            model=model,
+            train_loader=train_loader,
             val_loader=val_loader,
-            save_path=save_path,
             val_dataset_subset=val_subset,
             original_dataset=full_dataset,
-            epochs=epochs, 
+            epochs=epochs,
+            save_dir=save_path,
+            device=device
         )
 
         fold_time = time.time() - fold_start

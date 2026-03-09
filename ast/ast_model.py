@@ -20,11 +20,11 @@ class ASTGenreClassifier(nn.Module):
         Linear(256 -> num_classes)
     """
 
-    def __init__(self, num_classes: int,
-                 time_frames: int = 1024,
-                 mel_bins: int = 128,
-                 dropout_1: float = 0.3,
-                 dropout_2: float = 0.2):
+    def __init__(
+            self, num_classes: int,
+             time_frames: int = 1024,
+             mel_bins: int = 128,
+        ):
         """
         Args:
             num_classes : Number of output genre classes.
@@ -56,11 +56,8 @@ class ASTGenreClassifier(nn.Module):
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, 512),
             nn.GELU(),
-            nn.Dropout(dropout_1),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Dropout(dropout_2),
-            nn.Linear(256, num_classes),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
         )
 
     @property
@@ -88,7 +85,7 @@ class ASTGenreClassifier(nn.Module):
         """
 
         # Remove channel dimension if present
-        if input_values.dim( ) == 4:
+        if input_values.dim() == 4:
             input_values = input_values.squeeze(1)
 
         outputs = self.ast(input_values=input_values)

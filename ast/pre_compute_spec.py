@@ -1,5 +1,6 @@
 import os
 os.environ["TORCHAUDIO_USE_BACKEND_DISPATCHER"] = "0"
+import math
 import random
 from pathlib import Path
 from torch.utils.data import Dataset
@@ -122,10 +123,8 @@ class AST_Audio_DataLoader(Dataset):
                 waveform = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)(waveform)
 
             # for multi-part songs, estimate totlat length from part count 
-            part_len = waveform.shape[1]
-            est_total = part_len * len(wave_parts)
+            n_chunks = max(1, math.ceil(waveform.shape[1] / self.CHUNK_SAMPLES))
 
-            n_chunks = max(1, est_total // self.CHUNK_SAMPLES)
             for c in range(n_chunks):
                 self.index_map.append((song_idx, c * self.CHUNK_SAMPLES))
 
