@@ -13,8 +13,22 @@ import wandb
 from sklearn.model_selection import StratifiedKFold
 from transformers import get_cosine_schedule_with_warmup
 from collections import Counter
+from scipy.signal import butter, filtfilt
 
 from helper.golbal_variables import *
+
+
+def highpass_filter(audio: torch.Tensor, cutoff: int = 40, sample_rate: int = 16000):
+    b, a = butter(5, cutoff / (sample_rate / 2), btype='high')
+
+    audio_np = audio.squeeze(0).cpu().numpy()
+    filtered = filtfilt(b, a, audio_np)
+
+    filtered = np.ascontiguousarray(filtered)
+
+    filtered = torch.from_numpy(filtered).unsqueeze(0)
+    return filtered.type_as(audio)
+
 
 
 def mixup_data(
@@ -112,6 +126,10 @@ def train_wav2vec2(
       - Gradient checkpointing: trades compute for memory in the encoder
         (enabled on the model before calling this function)
     """
+    model.train()
+    running_loss = correct = total = 0
+    optimizer.zero_grad()
+
     for step, (input_values, attention_mask, labels) in enumerate(dataloader):
         
         input_values = input_values.to(device)
@@ -209,9 +227,9 @@ def test_wav2vec2_song_level(
     with torch.no_grad():
         for real_idx in dataset_subset.indices:
 
-            waveform, attn_mask, label = original_dataset[real_idx]
+            waveform, label = original_dataset[real_idx]
             waveform = waveform.unsqueeze(0).to(device)
-            attn_mask = attn_mask.unsqueeze(0).to(device)
+            attn_mask = torch.ones(waveform.shape, dtype=torch.long, device=device)
 
             pred = torch.argmax(model(waveform, attn_mask), dim=1).item()
 
@@ -386,12 +404,13 @@ def train_wav2vec2_model(
         )
 
         val_acc_song = None
-
-        val_acc_song = test_wav2vec2_song_level(
-            model=model, 
-            val_dataset_subset=val_dataset_subset, original_dataset=original_dataset, 
-            device=device
-        )
+        if val_dataset_subset is not None and original_dataset is not None:
+            val_acc_song = test_wav2vec2_song_level(
+                model=model,
+                dataset_subset=val_dataset_subset,
+                original_dataset=original_dataset,
+                device=device,
+            )
 
         epoch_time  = time.time() - epoch_start
         current_lr  = optimizer.param_groups[0]["lr"]
@@ -410,7 +429,8 @@ def train_wav2vec2_model(
         if val_acc_song is not None:
             log_dict["val_accuracy_song"] = val_acc_song
 
-        wandb_run.log(log_dict)
+        if wandb_run is not None:
+            wandb_run.log(log_dict)
 
         song_str = f" | Song: {val_acc_song:6.2f}%" if val_acc_song else ""
         print(f"Epoch [{epoch+1:3d}/{epochs}] | "
@@ -485,8 +505,7 @@ def train_wav2vec2_cross_validation(
     model_fn,
     device: str,
     full_dataset: Subset,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
+    fold_data_fn,
     n_folds: int = 5, 
     epochs: int = 30,
     save_dir="cv_models_wav2vec2",
@@ -498,8 +517,9 @@ def train_wav2vec2_cross_validation(
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    all_labels  = np.array(full_dataset.labels)
+    all_labels  = np.array([full_dataset.labels[full_dataset.index_map[i][0]] for i in range(len(full_dataset))])
     all_indices = np.arange(len(full_dataset))
+
     skf = StratifiedKFold(
         n_splits=n_folds, 
         shuffle=True, 
@@ -526,8 +546,7 @@ def train_wav2vec2_cross_validation(
         os.makedirs(fold_dir, exist_ok=True)
         save_path = os.path.join(fold_dir, f"best_wav2vec2_fold{fold_num}.pth")
 
-        train_subset = Subset(full_dataset, train_idx)
-        val_subset = Subset(full_dataset, val_idx)
+        train_loader, val_loader, val_subset = fold_data_fn(train_idx, val_idx)
 
         model = model_fn().to(device)
 

@@ -1,9 +1,0 @@
-AST treats audio entirely as a visual classification problem. It is a "convolution-free" model, meaning it drops traditional Convolutional Neural Networks (CNNs) and relies purely on the self-attention mechanisms of a Vision Transformer (ViT).
-
-step-by-step data flow:
-    -> Spectrogram Generation: The raw 1D audio waveform is mathematically converted into a 2D Mel-spectrogram (typically using 128 frequency bands). This creates a literal image of how frequencies shift over time.
-    -> Patching: The 2D spectrogram image is chopped up into a grid of small, overlapping squares called "patches" (usually 16x16 pixels with a 6-pixel overlap).
-    -> Linear Embedding: Each 2D patch is flattened and passed through a linear projection layer to become a 1D embedding vector.
-    -> Positional Embeddings & [CLS] Token: Because transformers process all inputs simultaneously and don't inherently understand temporal order, a learnable "positional embedding" is added to each patch. This tells the model exactly where that patch belongs in time and frequency. A special [CLS] (classification) token is prepended to the sequence.
-    -> Transformer Encoder: The entire sequence of patch embeddings is fed into a standard multi-layer Transformer Encoder (typically 12 layers and 12 attention heads). The self-attention mechanism allows the model to capture long-range global context across the whole audio clip at once.
-    -> Classification Head: To get the final prediction, the model takes the final output state of the [CLS] token and passes it through a linear layer to output your audio classes (like genres).

@@ -1,6 +1,7 @@
 import os
 os.environ["TORCHAUDIO_USE_BACKEND_DISPATCHER"] = "0"
 
+import math
 import random
 from pathlib import Path
 from torch.utils.data import Dataset
@@ -8,25 +9,13 @@ import torchaudio
 from transformers import Wav2Vec2Processor
 import torch
 import numpy as np
-from scipy.signal import butter, filtfilt
+
+from utils import highpass_filter
 
 
 SAMPLE_RATE    = 16000
 CHUNK_DURATION = 10.24
 CHUNK_SAMPLES  = int(SAMPLE_RATE * CHUNK_DURATION)
-
-
-def highpass_filter(audio: torch.Tensor, cutoff: int = 40, sample_rate: int = 16000):
-    b, a = butter(5, cutoff / (sample_rate / 2), btype='high')
-
-    audio_np = audio.squeeze(0).cpu().numpy()
-    filtered = filtfilt(b, a, audio_np)
-
-    filtered = np.ascontiguousarray(filtered)
-
-    filtered = torch.from_numpy(filtered).unsqueeze(0)
-    return filtered.type_as(audio)
-
 
 
 class Wav2Vec2_Audio_Dataset(Dataset):
@@ -93,8 +82,7 @@ class Wav2Vec2_Audio_Dataset(Dataset):
             if sr != self.SAMPLE_RATE:
                 waveform = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)(waveform)
 
-            est_total = waveform.shape[1] * len(wav_parts)
-            n_chunks  = max(1, est_total // self.CHUNK_SAMPLES)
+            n_chunks = max(1, math.ceil(waveform.shape[1] / self.CHUNK_SAMPLES))
 
             for c in range(n_chunks):
                 self.index_map.append((song_idx, c * self.CHUNK_SAMPLES))

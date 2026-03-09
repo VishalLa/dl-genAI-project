@@ -13,7 +13,7 @@ from transformers import ASTFeatureExtractor
 from utils import highpass_filter
 
 
-def load_ensemble(model_fn: nn.Module, model_paths: list, device: str):
+def load_ensemble(model_fn: function, model_paths: list, device: str) -> list[nn.Module]:
     """
     Load multiple saved fold models into a list, ready for ensemble inference.
 
@@ -29,7 +29,7 @@ def load_ensemble(model_fn: nn.Module, model_paths: list, device: str):
     models = []
     for path in model_paths: 
         # Create a deep copy so each fold gets its own instance in memory
-        m: nn.Module = copy.deepcopy(model_fn).to(device) 
+        m: nn.Module = copy.deepcopy(model_fn()).to(device) 
         m.load_state_dict(torch.load(path, map_location=device))
         m.eval()
         models.append(m)
@@ -38,7 +38,7 @@ def load_ensemble(model_fn: nn.Module, model_paths: list, device: str):
     return models
 
 
-def load_ensemble_from_cv_dir(model_fn, results_path: str, device: str) -> tuple[list[nn.Module], dict]:
+def load_ensemble_from_cv_dir(model_fn: function, results_path: str, device: str) -> tuple[list[nn.Module], dict]:
     """
     Auto-discovers fold model paths from modelspaths.json and loads ensemble.
 

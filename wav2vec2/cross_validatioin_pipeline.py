@@ -120,6 +120,45 @@ class Wav2Vec2Pipeline:
         return train_loader, val_loader, train_subset, val_subset, full_dataset
     
 
+    def _make_fold_loaders(self, train_idx, val_idx):
+        """
+        Called once per CV fold. Builds train/val DataLoaders from fold indices.
+        All DataLoader config lives here in the pipeline.
+        Returns (train_loader, val_loader, val_subset).
+        """
+        train_subset = Subset(self.full_dataset, train_idx)
+        val_subset = Subset(self.full_dataset, val_idx)
+
+        fold_labels = [self.full_dataset.labels[self.full_dataset.index_map[i][0]] for i in train_idx]
+        class_counts = Counter(fold_labels)
+        class_weights  = {cls: 1.0 / count for cls, count in class_counts.items()}
+        sample_weights = [class_weights[lbl] for lbl in fold_labels]
+
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=self.batch_size,
+            sampler=sampler,
+            collate_fn=collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=(self.device == "cuda"),
+        )
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=(self.device == "cuda"),
+        )
+        return train_loader, val_loader, val_subset
+    
+
     def single_run(self, save_dir: str = "wav2vec2_single_run"):
         """Train one model on the full train split."""
         model = self.model_fn().to(self.device)
@@ -143,8 +182,7 @@ class Wav2Vec2Pipeline:
             model_fn=self.model_fn,
             device=self.device,
             full_dataset=self.full_dataset,
-            train_loader=self.train_loader,
-            val_loader=self.val_loader,
+            fold_data_fn=self._make_fold_loaders,
             n_folds=self.n_folds,
             epochs=self.epochs,
             save_dir=save_dir,
