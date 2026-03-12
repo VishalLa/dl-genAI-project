@@ -1,19 +1,19 @@
 {
     "model_paths": {
         "ast-model": {
-            "model_1": "ast-models\\best_ast_genre_1.pth",
-            "model_2": "ast-models\\best_ast_genre_2.pth",
-            "model_3": "ast-models\\best_ast_genre_3.pth",
-            "model_4": "ast-models\\best_ast_genre_4.pth",
-            "model_5": "ast-models\\best_ast_genre_5.pth",
-            "model_6": "ast-models\\best_ast_genre_score(0.82).pth",
-            "model_7": "ast-models\\best_ast_genre_score(0.839).pth",
-            "model_8": "ast-models\\best_ast_genre_v5.pth"
+            "model_1": "weights/ast-models/best_ast_genre_1.pth",
+            "model_2": "weights/ast-models/best_ast_genre_2.pth",
+            "model_3": "weights/ast-models/best_ast_genre_3.pth",
+            "model_4": "weights/ast-models/best_ast_genre_4.pth",
+            "model_5": "weights/ast-models/best_ast_genre_5.pth",
+            "model_6": "weights/ast-models/best_ast_genre_score(0.82).pth",
+            "model_7": "weights/ast-models/best_ast_genre_score(0.839).pth",
+            "model_8": "weights/ast-models/best_ast_genre_v5.pth"
         },
         "wav2vec2-model": {
-            "model_1": "wav2vec2-models\\best_wav2vec2_fold1.pth",
-            "model_2": "wav2vec2-models\\best_wav2vec2_fold2.pth",
-            "model_3": "wav2vec2-models\\best_wav2vec2_fold3.pth"
+            "model_1": "weights/wav2vec2-models/best_wav2vec2_fold1.pth",
+            "model_2": "weights/wav2vec2-models/best_wav2vec2_fold2.pth",
+            "model_3": "weights/wav2vec2-models/best_wav2vec2_fold3.pth"
         }
     }
 }

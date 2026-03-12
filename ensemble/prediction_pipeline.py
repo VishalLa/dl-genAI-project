@@ -1,6 +1,7 @@
 import os 
 import json
 import copy
+import math
 import pandas as pd
 import numpy as np
 
@@ -146,14 +147,22 @@ class PredictionPipeline:
     WAV2VEC2_FEATURE_EXTRACTION = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base")
 
     def __init__(
-            self, 
-            models: Dict[str, List[nn.Module]],
-            genre_map: dict,
-            batch_size: int = 32,
-            ratio: float = 0.25
+        self, 
+        models: Dict[str, List[nn.Module]],
+        genre_map: dict,
+        batch_size: int = 32,
+        ratio: float = None,
+        temperature: float = 1.0,
     ):
         
         self.models = models
+
+        n_ast = len(self.models["ast-models"])
+        n_wav2vec2 = len(self.models["wav2vec2-models"])
+
+        self.ast_weight = (n_ast / (n_ast + n_wav2vec2)) if ratio is None else (1 - ratio)
+        self.wav2vec2_weight = (n_wav2vec2 / (n_ast + n_wav2vec2)) if ratio is None else ratio
+        self.temperature = temperature
 
         self.genre_map = genre_map
         self.index_to_genre = {v: k for k, v in self.genre_map.items()}
@@ -190,7 +199,7 @@ class PredictionPipeline:
         """Split waveform into fixed-length chunks; pad the last one if needed."""
 
         total_samples = waveform.shape[1]
-        n_chunks = max(1, total_samples // self.CHUNK_SAMPLES)
+        n_chunks = max(1, math.ceil(total_samples / self.CHUNK_SAMPLES))
 
         chunks = []
         for c in range(n_chunks):
@@ -263,7 +272,7 @@ class PredictionPipeline:
 
     
     @torch.no_grad()
-    def _get_chunk_probs_for_ast(self, spectrograms: torch.Tensor) -> torch.Tensor:
+    def _get_chunk_probs_for_ast_for_batch(self, spectrograms: torch.Tensor) -> torch.Tensor:
         """
         Run all chunks through all models in batches.
 
@@ -292,7 +301,7 @@ class PredictionPipeline:
     
 
     @torch.no_grad()
-    def _get_chunk_probs_for_wav2vec2(self, waveform: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _get_chunk_probs_for_wav2vec2_for_batch(self, waveform: Dict[str, torch.Tensor]) -> torch.Tensor:
 
         """
         Run all waveform chunks through all Wav2Vec2 models in batches.
@@ -321,12 +330,153 @@ class PredictionPipeline:
         # Average across ensemble models → [N, C]
         ensemble_probs = torch.stack(models_chunk_probs).mean(dim=0)
         return ensemble_probs
+    
 
+    @torch.no_grad()
+    def _get_chunk_probs_for_ast_for_single(self, spectrograms: torch.Tensor) -> torch.Tensor:
+        """
+        Run N individual spectrogram chunks through all AST fold models one at a time.
+        spectrograms : [N, 1024, 128]
+        
+        Returns: 
+            [N, C] averaged over ensemble.
+        """
 
-    def predict(self, audio_path: Path, verbose: bool = False) -> tuple:
+        n_chunks = spectrograms.shape[0]
+        models_chunks_probs = []
+
+        for model in self.models["ast-models"]:
+            model_probs = []
+
+            for i in range(0, n_chunks):
+                chunk  = spectrograms[i].unsqueeze(0).to(self.device)
+                logits = model(chunk)
+
+                probs = torch.softmax(logits, dim=1).cpu()
+                model_probs.append(probs)
+
+            models_chunks_probs.append(torch.cat(model_probs, dim=0))
+
+        ensemble_probs = torch.stack(models_chunks_probs).mean(dim=0)
+        return ensemble_probs
+    
+    
+    @torch.no_grad()
+    def _get_chunk_probs_for_wav2vec2_for_single(self, waveform: Dict[str, torch.Tensor]) -> torch.Tensor: 
 
         """
-        Full song-level prediction.
+        Run N individual waveform chunks through all Wav2Vec2 fold models one at a time.
+        waveform["input_values"]  : [N, T]
+        
+        Returns:
+            [N, C] averaged over ensemble.
+        """
+
+        n_chunks = len(waveform["input_values"])
+        models_chunk_probs = []
+
+        for model in self.models["wav2vec2-models"]:
+            model_probs = []
+
+            for i in range(0, n_chunks):
+                chunk = waveform["input_values"][i].unsqueeze(0).to(self.device)
+                mask = waveform["attention_mask"][i].unsqueeze(0).to(self.device)
+
+                logits = model(input_values=chunk, attention_mask=mask)
+
+                probs = torch.softmax(logits, dim=1).cpu()
+                model_probs.append(probs)
+            
+            models_chunk_probs.append(torch.cat(model_probs, dim=0))
+        
+        # Average across ensemble models → [N, C]
+        ensemble_probs = torch.stack(models_chunk_probs).mean(dim=0)
+        return ensemble_probs 
+
+
+    def _apply_temperature(self, probs: torch.Tensor) -> torch.Tensor:
+        """
+        Soften overconfident probability distributions.
+        T > 1 flattens distribution, T < 1 sharpens it.
+        Applied before blending so neither model dominates unfairly.
+        """
+        if self.temperature == 1.0:
+            return probs  # no-op, skip computation
+        log_probs = torch.log(probs.clamp(min=1e-9)) / self.temperature
+        return torch.softmax(log_probs, dim=-1)
+    
+
+    def _blend_and_vote(
+        self,
+        ast_probs: torch.Tensor,
+        wav2vec2_probs: torch.Tensor,
+        chunks: list,
+        verbose: bool = False,
+        audio_path: Path = None,
+        return_json: bool = False,
+    ) -> tuple | dict:
+
+        ast_probs = self._apply_temperature(ast_probs)
+        wav2vec2_probs = self._apply_temperature(wav2vec2_probs)
+
+        blended = self.ast_weight * ast_probs + self.wav2vec2_weight * wav2vec2_probs  # [N, C]
+        avg_probs = blended.mean(dim=0)   # [C]
+
+        # Soft vote
+        soft_idx = avg_probs.argmax().item()
+        soft_confidence = avg_probs[soft_idx].item()
+        predicted_genre = self.index_to_genre[soft_idx]
+
+        # Hard vote (diagnostic)
+        chunk_preds = blended.argmax(dim=1).tolist()
+        hard_idx = Counter(chunk_preds).most_common(1)[0][0]
+        hard_votes = chunk_preds.count(hard_idx)
+        hard_genre = self.index_to_genre[hard_idx]
+
+        all_probs_sorted = dict(sorted(
+            {self.index_to_genre[i]: avg_probs[i].item() for i in range(len(avg_probs))}.items(),
+            key=lambda x: x[1], reverse=True,
+        ))
+
+        if verbose:
+            agreement = (
+                "✅ agree" if soft_idx == hard_idx
+                else f"⚠️ disagree (hard → {hard_genre} {hard_votes}/{len(chunks)} chunks)"
+            )
+            print(f"\n[PredictionPipeline]  {Path(audio_path).name}")
+            print(f"  Chunks      : {len(chunks)}")
+            print(f"  AST weight  : {self.ast_weight:.0%}  |  Wav2Vec2 weight: {self.wav2vec2_weight:.0%}")
+            print(f"  Temperature : {self.temperature}")
+            print(f"  Soft vote   : {predicted_genre}  ({soft_confidence:.1%})")
+            print(f"  Hard vote   : {hard_genre}  ({hard_votes}/{len(chunks)} chunks)  {agreement}")
+            print(f"  Top-3:")
+            for genre, prob in list(all_probs_sorted.items())[:3]:
+                print(f"      {genre:20s}: {prob:.1%}")
+
+        if return_json:
+            return {
+                "genre":      predicted_genre,
+                "confidence": round(soft_confidence, 4),
+                "all_probs":  {k: round(v, 4) for k, v in all_probs_sorted.items()},
+                "hard_vote": {
+                    "genre":  hard_genre,
+                    "votes":  hard_votes,
+                    "chunks": len(chunks),
+                    "agree":  soft_idx == hard_idx,
+                },
+                "weights": {
+                    "ast":      round(self.ast_weight, 3),
+                    "wav2vec2": round(self.wav2vec2_weight, 3),
+                },
+            }
+
+        return predicted_genre, soft_confidence, all_probs_sorted
+
+
+    def batch_prediction(self, audio_path: Path, verbose: bool = False, return_json: bool = False) -> tuple | dict:
+
+        """
+        Full song-level prediction in batches.
 
         Blends AST and Wav2Vec2 chunk probabilities with soft voting:
             final = (1 - ratio) * ast_avg + ratio * wav2vec2_avg
@@ -345,102 +495,123 @@ class PredictionPipeline:
         ast_input = self._chunks_to_spectrograms_for_ast(chunks=chunks)
         wav2vec2_input = self._chunk_processor_for_wav2vec2(chunks=chunks)
 
-        ast_probs = self._get_chunk_probs_for_ast(spectrograms=ast_input)
-        wav2vec2_probs = self._get_chunk_probs_for_wav2vec2(waveform=wav2vec2_input)
+        ast_probs = self._get_chunk_probs_for_ast_for_batch(spectrograms=ast_input)
+        wav2vec2_probs = self._get_chunk_probs_for_wav2vec2_for_batch(waveform=wav2vec2_input)
 
-        blended_probs = (1 - self.ratio) * ast_probs + self.ratio * wav2vec2_probs  # [N, C]
-        avg_probs = blended_probs.mean(dim=0)      # [C]
-
-        # Soft vote 
-        soft_idx = avg_probs.argmax().item()
-        soft_confidence = avg_probs[soft_idx].item()
-        predicted_genre = self.index_to_genre[soft_idx]
-
-        # Hart vote 
-        chunk_preds = blended_probs.argmax(dim=1).tolist()
-        hard_idx = Counter(chunk_preds).most_common(1)[0][0]
-        hard_votes = chunk_preds.count(hard_idx)
-        hard_genre = self.index_to_genre[hard_idx]
-
-
-        all_probs_sorted = dict(sorted(
-            {self.index_to_genre[i]: avg_probs[i].item() for i in range(len(avg_probs))}.items(),
-            key=lambda x: x[1], reverse=True
-        ))
-
-        if verbose:
-            agreement = (
-                "✅ agree" if soft_idx == hard_idx
-                else f"⚠️ disagree (hard → {hard_genre} {hard_votes}/{len(chunks)} chunks)"
-            )
-            print(f"\n[PredictionPipeline]  {Path(audio_path).name}")
-            print(f"  Chunks     : {len(chunks)}")
-            print(f"  AST weight : {(1-self.ratio):.0%}  |  Wav2Vec2 weight: {self.ratio:.0%}")
-            print(f"  Soft vote  : {predicted_genre}  ({soft_confidence:.1%})")
-            print(f"  Hard vote  : {hard_genre}  ({hard_votes}/{len(chunks)} chunks)  {agreement}")
-            print(f"  Top-3      :")
-            for genre, prob in list(all_probs_sorted.items())[:3]:
-                print(f"      {genre:20s}: {prob:.1%}")
-
-        return predicted_genre, soft_confidence, all_probs_sorted
+        return self._blend_and_vote(
+            ast_probs=ast_probs, 
+            wav2vec2_probs=wav2vec2_probs,
+            chunks=chunks, 
+            verbose=verbose, 
+            audio_path=audio_path,
+            return_json=return_json,
+        )
     
 
-    # def predict_dataset(self, audio_paths: list[Path]) -> list[dict]:
-    #     """
-    #     Process a large list of audio files and return the results.
-    #     Uses tqdm for a progress bar.
-    #     """
-    #     results = []
-    #     print(f"Starting inference on {len(audio_paths)} files using {len(self.models)} models...")
-        
-    #     for path in tqdm(audio_paths, desc="Classifying Songs"):
-    #         try:
-    #             genre, conf, all_probs = self.predict(path, verbose=False)
-    #             results.append({
-    #                 "id": path.name,
-    #                 "predicted_genre": genre,
-    #                 "confidence": conf,
-    #                 "all_probs": all_probs
-    #             })
-    #         except Exception as e:
-    #             print(f"\nError processing {path.name}: {e}")
-    #             results.append({
-    #                 "file_name": path.name,
-    #                 "predicted_genre": "ERROR",
-    #                 "confidence": 0.0,
-    #                 "all_probs": {}
-    #             })
-                
-    #     return results
-    
+    def single_prediction(self, audio_path: Path, verbose: bool = False, return_json: bool = False) -> tuple | dict:
 
-    def predict_dataset(self, test_df: pd.DataFrame, data_dir: Path) -> pd.DataFrame:
         """
-        Run inference on every row in test_df.
+        Full song-level prediction for single song.
 
-        Args:
-            test_df  : DataFrame with columns ["id", "filename"]
-            data_dir : Root directory containing the audio files
+        Blends AST and Wav2Vec2 chunk probabilities with soft voting:
+            final = (1 - ratio) * ast_avg + ratio * wav2vec2_avg
 
         Returns:
-            DataFrame with columns ["id", "genre"]
+            predicted_genre : str
+            confidence      : float   (winning class probability)
+            all_probs       : dict    {genre: prob} sorted descending
         """
-        results = {}
-        print(f"Inference on {len(test_df)} files | "
-              f"{len(self.models['ast-models'])} AST + "
-              f"{len(self.models['wav2vec2-models'])} Wav2Vec2 models")
 
-        for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Classifying"):
-            song_id = row["id"]
-            audio_path = data_dir / row["filename"]
+        waveform = self._load_and_preprocess(audio_path=audio_path)
+        chunks = self._chunk_wavefrom(waveform=waveform)
+
+        chunks = [self._normalize_chunk(chunk=chunk) for chunk in chunks]
+
+        ast_input = self._chunks_to_spectrograms_for_ast(chunks=chunks)
+        wav2vec2_input = self._chunk_processor_for_wav2vec2(chunks=chunks)
+
+        ast_probs = self._get_chunk_probs_for_ast_for_single(spectrograms=ast_input)
+        wav2vec2_probs = self._get_chunk_probs_for_wav2vec2_for_single(waveform=wav2vec2_input)
+
+        return self._blend_and_vote(
+            ast_probs=ast_probs, 
+            wav2vec2_probs=wav2vec2_probs,
+            chunks=chunks, 
+            verbose=verbose, 
+            audio_path=audio_path,
+            return_json=return_json,
+        )
+        
+
+
+    def predict_dataset(self, audio_paths: List[Path], mode: str = "batch", return_json: bool = False) -> List[dict]:
+        """
+        Process a list of audio files and return results.
+
+        Args:
+            audio_paths : list of Path objects
+            mode        : "batch" (faster) or "single" (lower memory)
+        """
+
+        assert mode in ("batch", "single"), "mode must be 'batch' or 'single'"
+
+        predict_fn = self.batch_prediction if mode == "batch" else self.single_prediction
+
+        results = []
+        print(f"Starting inference on {len(audio_paths)} files | "
+            f"{len(self.models['ast-models'])} AST + {len(self.models['wav2vec2-models'])} Wav2Vec2 models | "
+            f"mode={mode}")
+
+        for path in tqdm(audio_paths, desc="Classifying Songs"):
             try:
-                genre, _, _ = self.predict(audio_path=audio_path, verbose=False)
-                results[song_id] = genre
+                genre, conf, all_probs = predict_fn(path, verbose=False)
+                results.append({
+                    "id": path.name,
+                    "predicted_genre": genre,
+                    "confidence": conf,
+                    "all_probs": all_probs,
+                })
             except Exception as e:
-                print(f"\n  Error on {row['filename']} (id={song_id}): {e}")
-                results[song_id] = "blues"   # fallback
+                print(f"\nError processing {path.name}: {e}")
+                results.append({
+                    "id": path.name,
+                    "predicted_genre": "ERROR",
+                    "confidence":  0.0,
+                    "all_probs": {},
+                })
+        if return_json:
+            return results
 
-        results_df = pd.DataFrame(
-            list(results.items()), columns=["id", "genre"]
-        ).set_index("id")
-        return results_df
+        return [(r["genre"], r["confidence"], r["all_probs"]) for r in results]
+    
+
+    # def predict_dataset(self, test_df: pd.DataFrame, data_dir: Path) -> pd.DataFrame:
+    #     """
+    #     Run inference on every row in test_df.
+
+    #     Args:
+    #         test_df  : DataFrame with columns ["id", "filename"]
+    #         data_dir : Root directory containing the audio files
+
+    #     Returns:
+    #         DataFrame with columns ["id", "genre"]
+    #     """
+    #     results = {}
+    #     print(f"Inference on {len(test_df)} files | "
+    #           f"{len(self.models['ast-models'])} AST + "
+    #           f"{len(self.models['wav2vec2-models'])} Wav2Vec2 models")
+
+    #     for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Classifying"):
+    #         song_id = row["id"]
+    #         audio_path = data_dir / row["filename"]
+    #         try:
+    #             genre, _, _ = self.predict(audio_path=audio_path, verbose=False)
+    #             results[song_id] = genre
+    #         except Exception as e:
+    #             print(f"\n  Error on {row['filename']} (id={song_id}): {e}")
+    #             results[song_id] = "blues"   # fallback
+
+    #     results_df = pd.DataFrame(
+    #         list(results.items()), columns=["id", "genre"]
+    #     ).set_index("id")
+    #     return results_df
