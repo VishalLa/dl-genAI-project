@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as transforms
+from collections import Counter
 
 
 class ImageDataset_for_CRNN(Dataset):
@@ -31,25 +32,29 @@ class ImageDataset_for_CRNN(Dataset):
     - Returns (image_tensor, label)
     """
 
-    def __init__(self, path: Path, target_size: tuple = (400, 600), in_channel: int = 1):
+    def __init__(
+        self, 
+        path: Path, 
+        target_size: tuple = (400, 600),
+        in_channel: int = 1, 
+        train: bool = True
+    ):
         """
-        Initializes the dataset.
-
         Args:
-            path (Path): Root directory containing genre folders.
-            target_size (tuple): Desired image size (height, width).
-                                 Default = (400, 600)
-            in_channel (int): Number of image channels.
-                              1 → Grayscale
-                              3 → RGB
+            path        : Root directory containing genre folders.
+            target_size : (height, width). Default (400, 600).
+            in_channel  : 1 = Grayscale, 3 = RGB.
+            train       : If True, apply SpecAugment-style pixel masking.
         """
         self.target_size = target_size
-        self.in_channel = in_channel
+        self.in_channel  = in_channel
         self.path = path
+        self.train = train
 
-        self.samples = []
-        self.labels = []
-        self.class_map = {}
+        self.samples = []   # list of image paths
+        self.labels = []   # list of int labels
+        self.class_map = {}   # genre_name -> label_id
+        self.index_map = []   # list of (global_song_idx, chunk_num) — for song-level split
 
         """
         Transform sequence:
@@ -83,6 +88,8 @@ class ImageDataset_for_CRNN(Dataset):
             - Total image count
             - Images per genre
         """
+        global_song_counter = 0
+
         for label_id, genre_dir in enumerate(sorted(self.path.iterdir())):
 
             if not genre_dir.is_dir():
@@ -98,13 +105,46 @@ class ImageDataset_for_CRNN(Dataset):
                 continue
 
             for img_path in all_images:
+                stem = img_path.stem 
+                parts = stem.split("_")
+
+                # Parse song_id and chunk_idx from filename
+                # Expected: {song_id}_chunk{idx}_{variant}
+                try:
+                    song_id = parts[0]                    # "001"
+                    chunk_idx = int(parts[1].replace("chunk", ""))  # 2
+                except (IndexError, ValueError):
+                    song_id   = stem
+                    chunk_idx = 0
+
+                # Local song index within genre (song_id as int if numeric)
+                try:
+                    local_song = int(song_id)
+                except ValueError:
+                    local_song = hash(song_id) % 10000
+
+                global_song_idx = global_song_counter + local_song
+                # max_local_song  = max(max_local_song, local_song)
+
                 self.samples.append(img_path)
                 self.labels.append(label_id)
+                self.index_map.append((global_song_idx, chunk_idx))
+            
+            # global_song_counter += max_local_song + 1
+
+        print(f"Classes   : {self.class_map}")
+        print(f"Total imgs: {len(self.samples)}")
+
+        label_counts = Counter(self.labels)
+        print("\nImages per genre:")
+        for genre, cid in sorted(self.class_map.items(), key=lambda x: x[1]): print(f"  {genre:<12} {label_counts[cid]:5d} images")
+
+        mode = "train" if self.train else "val"
+        print(f"[{mode}] Dataset ready.\n")
 
         print(f"Classes: {self.class_map}")
         print(f"Total images: {len(self.samples)}")
 
-        from collections import Counter
         label_counts = Counter(self.labels)
 
         print("\nImages per genre:")

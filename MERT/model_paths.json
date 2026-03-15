@@ -1,0 +1,8 @@
+{
+    "ast-model": {
+        "model_1": "models\\best_mert_genre_1.pth",
+        "model_2": "models\\best_mert_genre_2.pth",
+        "model_3": "models\\best_mert_genre_3.pth",
+        "model_4": "models\\best_mert_genre_4.pth"
+    }
+}

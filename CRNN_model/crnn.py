@@ -165,10 +165,10 @@ class CRNN(nn.Module):
 
             if batch_norm:
                 cnn.add_module(f"batchnorm{idx}",
-                               nn.BatchNorm2d(output_channel))
+                    nn.BatchNorm2d(output_channel))
 
             cnn.add_module(f"relu{idx}",
-                           nn.LeakyReLU(0.2, inplace=True))
+            nn.LeakyReLU(0.2, inplace=True))
 
         # Block 1
         conv_layer(0)
@@ -227,7 +227,7 @@ class CRNN(nn.Module):
         """
 
         # CNN feature extraction
-        conv = self.cnn(x)
+        conv: torch.Tensor = self.cnn(x)
         # Shape: [B, C, H', W']
 
         batch, channel, height, width = conv.size()
@@ -238,18 +238,18 @@ class CRNN(nn.Module):
         # Shape: [W', B, C*H']
 
         # Linear projection
-        seq = self.conv_to_fc(conv)
+        seq: torch.Tensor = self.conv_to_fc(conv)
 
         # BiLSTM
         recurrent, _ = self.lstm(seq)
         recurrent = self.lstm_dropout(recurrent)
 
         # Convert to batch-first
-        recurrent = recurrent.permute(1, 0, 2)
+        recurrent: torch.Tensor = recurrent.permute(1, 0, 2)
         # Shape: [B, W', 2*rnn_hidden]
 
         # Attention
-        context = self.attention(recurrent)
+        context: torch.Tensor = self.attention(recurrent)
 
         # Average over time dimension
         context = context.mean(dim=1)
