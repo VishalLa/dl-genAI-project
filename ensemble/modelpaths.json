@@ -10,10 +10,11 @@
             "model_7": "weights/ast-models/best_ast_genre_score(0.839).pth",
             "model_8": "weights/ast-models/best_ast_genre_v5.pth"
         },
-        "wav2vec2-model": {
-            "model_1": "weights/wav2vec2-models/best_wav2vec2_fold1.pth",
-            "model_2": "weights/wav2vec2-models/best_wav2vec2_fold2.pth",
-            "model_3": "weights/wav2vec2-models/best_wav2vec2_fold3.pth"
+        "mert-model": {
+            "model_1": "weights/mert-models/best_mert_genre_1.pth",
+            "model_2": "weights/mert-models/best_mert_genre_2.pth",
+            "model_3": "weights/mert-models/best_mert_genre_3.pth",
+            "model_4": "weights/mert-models/best_mert_genre_4.pth"
         }
     }
 }

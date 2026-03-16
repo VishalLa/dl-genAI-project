@@ -1,5 +1,5 @@
-from ensemble.ast_model import ASTGenreClassifier 
-from ensemble.wav2vec2_model import Wav2Vec2ForGenre
+from ensemble.model_arch.ast_model import ASTGenreClassifier 
+from ensemble.model_arch.wav2vec2_model import Wav2Vec2ForGenre
 from ensemble.prediction_pipeline import PredictionPipeline, load_ensemble
 
 import torch 
