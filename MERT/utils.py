@@ -396,11 +396,12 @@ def train_mert_model(
                     param.requires_grad = True
             
             # 3. Unfreeze top 12 transformer layers (12-23)
-            for name, param in model.named_parameters():
-                for layer_idx in range(12, 24):
-                    if f"mert.encoder.layer.{layer_idx}." in name:
+            for layer_idx in range(12, 24):
+                layer_name = f"mert.encoder.layer.{layer_idx}"
+                for name, param in model.named_parameters():
+                    if layer_name in name:
                         param.requires_grad = True
-            
+
             # 4. Unfreeze layer norm if it exists
             for name, param in model.named_parameters():
                 if "mert.layernorm" in name or "mert.encoder.layernorm" in name:

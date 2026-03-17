@@ -37,18 +37,17 @@ class EndpointHandler:
         import sys 
         sys.path.insert(0, str(self.repo_dir))
         from model_arch.ast_model import ASTGenreClassifier
-        # from ensemble.model_arch.wav2vec2_model import Wav2Vec2ForGenre 
-        from model_arch.mert_model import MERTGenreClassifier
+        from ensemble.model_arch.wav2vec2_model import Wav2Vec2ForGenre 
         from prediction_pipeline import PredictionPipeline, load_ensemble
 
         self.ast_model_fn = lambda: ASTGenreClassifier(num_classes=len(self.GENRE_MAP))
-        self.mert_model_fn = lambda: MERTGenreClassifier(num_classes=len(self.GENRE_MAP))
+        self.wav2vec2_model_fn = lambda: Wav2Vec2ForGenre(num_classes=len(self.GENRE_MAP))
 
         self.json_path = self.repo_dir / "modelpaths.json"
 
         models = load_ensemble(
             ast_model_fn = self.ast_model_fn,
-            mert_model_fn = self.mert_model_fn, 
+            wav2vec2_model_fn=self.wav2vec2_model_fn, 
             json_path = self.json_path,
             device = self.device
         )
