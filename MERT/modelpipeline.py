@@ -14,31 +14,36 @@ class MERTPipeline:
         self,
         genre_dir: Path, 
         esc50_dir: Path,
-        batch_size: int = 8,
+        batch_size: int = 16,
         num_workers: int = 4,
         num_classes: int = 10,
         epochs: int = 30,
         n_folds: int = 5,
         sample_rate: int = 24000,
-        chunk_duration: int = 30,
+        chunk_duration: int = 5,
         use_weighted_layers: bool = True,
         seed: int = 42,
     ):
         """
-        MERT Training Pipeline
+        MERT Training Pipeline with 5-second chunks
         
         Args:
             genre_dir: Path to genre dataset directory
             esc50_dir: Path to ESC-50 noise dataset
-            batch_size: Batch size for training (default 8, lower than AST due to larger model)
+            batch_size: Batch size for training (default 16 for 5-sec chunks, can be higher than 30-sec)
             num_workers: Number of data loading workers
             num_classes: Number of genre classes
             epochs: Number of training epochs
             n_folds: Number of folds for cross-validation
             sample_rate: Audio sample rate (must be 24000 for MERT)
-            chunk_duration: Audio chunk duration in seconds (default 30)
+            chunk_duration: Audio chunk duration in seconds (default 5 - MERT's native context)
             use_weighted_layers: Whether to use weighted layer aggregation
             seed: Random seed for reproducibility
+            
+        Note:
+            With 5-second chunks, a 30-second song produces 6 non-overlapping chunks.
+            This increases the effective dataset size by ~6x compared to full-song training.
+            Batch size can be increased compared to 30-second chunks due to lower memory usage.
         """
 
         self.genre_dir = genre_dir
@@ -73,13 +78,18 @@ class MERTPipeline:
 
     def load_data(self) -> tuple[DataLoader, DataLoader, Dataset]:
         """
-        Load and prepare MERT dataset with train/val split.
+        Load and prepare MERT dataset with 5-second chunks and train/val split.
         
         Returns:
             tuple: (train_dataloader, val_dataloader, full_dataset)
+            
+        Note:
+            The dataset automatically splits songs into 5-second chunks.
+            Train/val split is performed at the song level to prevent data leakage
+            (all chunks from a song go to either train or val, never both).
         """
         print("\n" + "=" * 70)
-        print("LOADING MERT DATASET")
+        print("LOADING MERT DATASET (5-second chunks)")
         print("=" * 70)
 
         # Load train and val datasets separately
@@ -96,50 +106,72 @@ class MERTPipeline:
         )
 
         print(f"Sample rate: {self.sample_rate} Hz")
-        print(f"Audio duration: {self.chunk_duration} seconds")
-        print(f"Expected audio length: {self.chunk_duration * self.sample_rate} samples")
+        print(f"Chunk duration: {self.chunk_duration} seconds")
+        print(f"Expected chunk length: {self.chunk_duration * self.sample_rate} samples")
+        print(f"Chunks per 30-second song: ~6")
 
         # Get unique songs from train dataset
         num_songs = len(train_full_dataset.samples)
-        all_indices = list(range(num_songs))
+        all_song_indices = list(range(num_songs))
         all_labels = train_full_dataset.labels
 
-        # 80-20 train-val split (stratified by genre)
+        # 80-20 train-val split (stratified by genre at song level)
         from sklearn.model_selection import train_test_split
         
-        train_indices, val_indices = train_test_split(
-            all_indices,
+        train_song_indices, val_song_indices = train_test_split(
+            all_song_indices,
             test_size=0.2,
             stratify=all_labels,
             random_state=self.seed
         )
 
-        print(f'\nSongs split: {len(train_indices)} train, {len(val_indices)} val')
+        print(f'\nSongs split: {len(train_song_indices)} train, {len(val_song_indices)} val')
 
-        # Create subsets
-        train_dataset = Subset(train_full_dataset, train_indices)
-        val_dataset = Subset(val_full_dataset, val_indices)
+        # Convert song-level indices to chunk-level indices
+        # This ensures all chunks from a song stay in the same split
+        train_chunk_indices = []
+        val_chunk_indices = []
+        
+        for chunk_idx, (song_idx, _) in enumerate(train_full_dataset.index_map):
+            if song_idx in train_song_indices:
+                train_chunk_indices.append(chunk_idx)
+            elif song_idx in val_song_indices:
+                val_chunk_indices.append(chunk_idx)
 
-        print(f'Train songs: {len(train_dataset)}')
-        print(f'Val songs:   {len(val_dataset)}')
+        print(f'Train chunks: {len(train_chunk_indices)} (from {len(train_song_indices)} songs)')
+        print(f'Val chunks:   {len(val_chunk_indices)} (from {len(val_song_indices)} songs)')
+        print(f'Avg chunks per song: {len(train_chunk_indices) / len(train_song_indices):.1f}')
 
-        # Calculate class weights for balanced sampling
-        train_labels = [train_full_dataset.labels[i] for i in train_indices]
+        # Create subsets at chunk level
+        train_dataset = Subset(train_full_dataset, train_chunk_indices)
+        val_dataset = Subset(val_full_dataset, val_chunk_indices)
+
+        # Calculate class weights for balanced sampling at song level
+        train_labels = [train_full_dataset.labels[i] for i in train_song_indices]
         class_counts = Counter(train_labels)
         class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
-        sample_weights = [class_weights[label] for label in train_labels]
+        
+        # Apply song-level weights to all chunks from that song
+        chunk_weights = []
+        for chunk_idx in train_chunk_indices:
+            song_idx, _ = train_full_dataset.index_map[chunk_idx]
+            label = train_full_dataset.labels[song_idx]
+            chunk_weights.append(class_weights[label])
 
         # Create weighted sampler for balanced training
         sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(sample_weights),
+            weights=chunk_weights,
+            num_samples=len(chunk_weights),
             replacement=True
         )
 
-        print('\nClass distribution in training set:')
+        print('\nClass distribution in training set (song-level):')
         genre_names = {v: k for k, v in train_full_dataset.class_map.items()}
         for cls, count in sorted(class_counts.items()):
-            print(f'  {genre_names[cls]}: {count} songs  (weight: {class_weights[cls]:.5f})')
+            chunks_for_class = sum(1 for i in train_chunk_indices 
+                                  if train_full_dataset.labels[train_full_dataset.index_map[i][0]] == cls)
+            print(f'  {genre_names[cls]}: {count} songs ({chunks_for_class} chunks)  '
+                  f'weight: {class_weights[cls]:.5f}')
 
         # Create dataloaders
         train_dataloader = DataLoader(
@@ -163,30 +195,35 @@ class MERTPipeline:
         )
 
         print(f'\nDataLoader created:')
-        print(f'  Train batches: {len(train_dataloader)}')
-        print(f'  Val batches:   {len(val_dataloader)}')
+        print(f'  Train batches: {len(train_dataloader)} (batch_size={self.batch_size})')
+        print(f'  Val batches:   {len(val_dataloader)} (batch_size={self.batch_size})')
         print("=" * 70 + "\n")
 
         return train_dataloader, val_dataloader, train_full_dataset
 
 
-    def single_run(self, save_dir: str = "./mert_models"):
+    def single_run(self, save_dir: str = "./mert_models_5sec"):
         """
-        Perform a single training run (no cross-validation).
+        Perform a single training run with 5-second chunks (no cross-validation).
         
         Args:
             save_dir: Directory to save the best model
             
         Returns:
             float: Best validation accuracy achieved
+            
+        Note:
+            The model is trained on 5-second chunks. Each 30-second song
+            contributes ~6 chunks to the training set.
         """
         print("\n" + "=" * 70)
-        print("STARTING SINGLE TRAINING RUN")
+        print("STARTING SINGLE TRAINING RUN (5-second chunks)")
         print("=" * 70)
         print(f"Device: {self.device}")
         print(f"Batch size: {self.batch_size}")
         print(f"Epochs: {self.epochs}")
         print(f"Model: MERT-v1-330M")
+        print(f"Chunk duration: {self.chunk_duration}s")
         print(f"Weighted layers: {self.use_weighted_layers}")
         print("=" * 70 + "\n")
 
@@ -205,30 +242,35 @@ class MERTPipeline:
         print(f"SINGLE RUN COMPLETE")
         print(f"{'=' * 70}")
         print(f"Best Validation Accuracy: {best_acc:.2f}%")
-        print(f"Model saved to: {save_dir}/best_mert_genre.pth")
+        print(f"Model saved to: {save_dir}/best_mert_genre_5sec.pth")
         print(f"{'=' * 70}\n")
 
         return best_acc
     
 
-    def cross_validation(self, save_dir: str = "cv_models_mert"):
+    def cross_validation(self, save_dir: str = "cv_models_mert_5sec"):
         """
-        Perform k-fold cross-validation.
+        Perform k-fold cross-validation with 5-second chunks.
         
         Args:
             save_dir: Directory to save cross-validation models and results
             
         Returns:
             list: Results from each fold
+            
+        Note:
+            Cross-validation splits are performed at the song level to prevent
+            data leakage. All chunks from a song are kept in the same fold.
         """
         print("\n" + "=" * 70)
-        print("STARTING CROSS-VALIDATION")
+        print("STARTING CROSS-VALIDATION (5-second chunks)")
         print("=" * 70)
         print(f"Device: {self.device}")
         print(f"Batch size: {self.batch_size}")
         print(f"Folds: {self.n_folds}")
         print(f"Epochs per fold: {self.epochs}")
         print(f"Model: MERT-v1-330M")
+        print(f"Chunk duration: {self.chunk_duration}s")
         print(f"Weighted layers: {self.use_weighted_layers}")
         print("=" * 70 + "\n")
 
@@ -241,7 +283,7 @@ class MERTPipeline:
             epochs=self.epochs,
             n_folds=self.n_folds,
             save_dir=save_dir,
-            wandb_project="mert-genre-classification-cross-validation"
+            wandb_project="mert-genre-classification-cross-validation-5sec"
         )
 
         print("\n" + "=" * 70)
@@ -249,7 +291,9 @@ class MERTPipeline:
         print("=" * 70)
         for result in fold_results:
             print(f"Fold {result['fold']}: {result['best_val_acc']:.2f}% "
-                  f"({result['time_minutes']:.1f} min)")
+                  f"({result['time_minutes']:.1f} min) - "
+                  f"{result['train_songs']} train songs ({result['train_chunks']} chunks), "
+                  f"{result['val_songs']} val songs ({result['val_chunks']} chunks)")
         print("=" * 70 + "\n")
 
         return fold_results
@@ -261,7 +305,7 @@ class MERTPipeline:
         params = model.count_parameters()
         
         print("\n" + "=" * 70)
-        print("MERT MODEL INFORMATION")
+        print("MERT MODEL INFORMATION (5-second chunks)")
         print("=" * 70)
         print(f"Model: {model.__class__.__name__}")
         print(f"Backbone: {model.model_name}")
@@ -269,11 +313,15 @@ class MERTPipeline:
         print(f"Sample rate: {model.sample_rate} Hz")
         print(f"Chunk duration: {model.chunk_duration} seconds")
         print(f"Expected input shape: [batch, {model.expected_length}]")
+        print(f"Expected frames: {model.expected_frames} (75 frames/sec × {model.chunk_duration}s)")
         print(f"Weighted layer aggregation: {model.use_weighted_layers}")
         print(f"\nParameters:")
         print(f"  Total:     {params['total']:,}")
         print(f"  Trainable: {params['trainable']:,} ({params['trainable_pct']:.2f}%)")
         print(f"  Frozen:    {params['frozen']:,}")
+        print("\nTraining Details:")
+        print(f"  Batch size: {self.batch_size}")
+        print(f"  30-second song → ~6 chunks × 5 seconds each")
+        print(f"  Effective dataset size: ~6× larger than full-song training")
         print("=" * 70 + "\n")
-
         

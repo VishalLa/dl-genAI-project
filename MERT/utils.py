@@ -185,7 +185,8 @@ def train_mert(
     - Mixup augmentation
     - Gradient clipping
     
-    Note: No chunking needed - all songs are 30 seconds.
+    Note: Each sample is now a 5-second chunk. Multiple chunks from the same
+    song are treated as independent samples during training.
     """
     model.train()
     running_loss = 0.0
@@ -259,8 +260,14 @@ def test_mert(
     device: str
 ):
     """
-    Song-level evaluation (each sample is a full 30-second song).
-    No chunking or majority voting needed.
+    Chunk-level evaluation for MERT.
+    
+    Each 5-second chunk is evaluated independently. This is appropriate
+    for training monitoring, where we want to see how well the model
+    classifies individual chunks.
+    
+    Note: For final song-level evaluation (inference), chunks should be
+    aggregated per song and predictions averaged/voted.
     """
     model.eval()
     running_loss = 0.0
@@ -295,7 +302,7 @@ def train_mert_model(
     epochs: int = 30
 ):
     """
-    3-Stage Progressive Fine-tuning for MERT-v1-330M:
+    3-Stage Progressive Fine-tuning for MERT-v1-330M with 5-second chunks:
     
     Stage 1 (0-30% of epochs): Classifier head only
         - Freeze MERT backbone
@@ -314,6 +321,9 @@ def train_mert_model(
         - LR: 1e-5 (base, with layer-wise decay)
         - Gradient accumulation: 4
         - Reduced mixup (alpha=0.2)
+        
+    Note: With 5-second chunks, each song produces ~6 chunks (30s / 5s),
+    so the effective training set size is ~6x larger than with full songs.
     """
     use_cuda = device == "cuda"
     if use_cuda:
@@ -531,10 +541,10 @@ def train_single_run(
     epochs: int = 30,
     save_dir: str = "."
 ):
-    """Single training run with WandB logging."""
+    """Single training run with WandB logging for 5-second chunk training."""
     
     print("\n" + "=" * 70)
-    print("MERT GENRE CLASSIFICATION — SINGLE RUN")
+    print("MERT GENRE CLASSIFICATION — SINGLE RUN (5-second chunks)")
     print("=" * 70 + "\n")
 
     use_cuda = device == "cuda"
@@ -543,7 +553,7 @@ def train_single_run(
 
     wandb.init(
         project="mert-genre-classification-single-run",
-        name="3-stage-mert-330m-llrd-mixup-amp",
+        name="3-stage-mert-330m-llrd-mixup-amp-5sec",
         config={
             "epochs": epochs,
             "optimizer": "AdamW + LLRD",
@@ -556,7 +566,7 @@ def train_single_run(
             "architecture": model.__class__.__name__,
             "base_model": "m-a-p/MERT-v1-330M",
             "sample_rate": 24000,
-            "chunk_duration": 30,
+            "chunk_duration": 5,
         }
     )
     
@@ -564,7 +574,7 @@ def train_single_run(
 
     model = model.to(device)
     os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, "best_mert_genre.pth")
+    save_path = os.path.join(save_dir, "best_mert_genre_5sec.pth")
 
     best_acc = train_mert_model(
         model=model,
@@ -587,33 +597,37 @@ def train_mert_cross_validation(
     num_workers: int = 4,
     n_folds: int = 5, 
     epochs: int = 30,
-    save_dir: str = "cv_models_mert",
-    wandb_project: str = "mert-genre-classification-cross-validation",
+    save_dir: str = "cv_models_mert_5sec",
+    wandb_project: str = "mert-genre-classification-cross-validation-5sec",
 ):
     """
-    Stratified K-Fold cross-validation for MERT.
+    Stratified K-Fold cross-validation for MERT with 5-second chunks.
 
     Each fold trains a completely independent model, saved to:
-        {save_dir}/fold_{k}/best_mert_genre_fold{k}.pth
+        {save_dir}/fold_{k}/best_mert_genre_fold{k}_5sec.pth
 
     A metadata JSON is also saved:
         {save_dir}/cv_results.json
+        
+    Note: Cross-validation is performed at the song level (not chunk level)
+    to prevent data leakage. Songs are split into folds, then chunks from
+    those songs are used for training/validation.
     """
     from mert_dataset import mert_collate_fn
     
     os.makedirs(save_dir, exist_ok=True)
 
     all_labels = np.array(full_dataset.labels)
-    all_indices = np.arange(len(full_dataset))
+    all_indices = np.arange(len(full_dataset.samples))  # Song-level indices
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
     fold_results = []
 
     print("\n" + "=" * 70)
-    print(f"MERT GENRE CLASSIFICATION — {n_folds}-FOLD CROSS-VALIDATION")
+    print(f"MERT GENRE CLASSIFICATION — {n_folds}-FOLD CROSS-VALIDATION (5-second chunks)")
     print("=" * 70)
-    print(f"  Dataset size : {len(full_dataset)} songs")
+    print(f"  Dataset size : {len(full_dataset.samples)} songs → {len(full_dataset)} chunks")
     print(f"  Folds        : {n_folds}")
     print(f"  Epochs/fold  : {epochs}")
     print(f"  Save dir     : {save_dir}")
@@ -621,26 +635,38 @@ def train_mert_cross_validation(
 
     cv_start = time.time()
 
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_indices, all_labels)):
+    for fold_idx, (train_song_idx, val_song_idx) in enumerate(skf.split(all_indices, all_labels)):
         fold_num = fold_idx + 1
 
+        # Convert song-level indices to chunk-level indices
+        train_chunk_idx = []
+        val_chunk_idx = []
+        
+        for chunk_idx, (song_idx, _) in enumerate(full_dataset.index_map):
+            if song_idx in train_song_idx:
+                train_chunk_idx.append(chunk_idx)
+            elif song_idx in val_song_idx:
+                val_chunk_idx.append(chunk_idx)
+
         print(f"\n{'═' * 70}")
-        print(f"  FOLD {fold_num}/{n_folds}  |  train={len(train_idx)}  val={len(val_idx)}")
+        print(f"  FOLD {fold_num}/{n_folds}  |  "
+              f"train={len(train_song_idx)} songs ({len(train_chunk_idx)} chunks)  "
+              f"val={len(val_song_idx)} songs ({len(val_chunk_idx)} chunks)")
         print(f"{'═' * 70}\n")
 
         fold_dir = os.path.join(save_dir, f"fold_{fold_num}")
         os.makedirs(fold_dir, exist_ok=True)
-        save_path = os.path.join(fold_dir, f"best_mert_genre_fold{fold_num}.pth")
+        save_path = os.path.join(fold_dir, f"best_mert_genre_fold{fold_num}_5sec.pth")
 
-        train_subset = Subset(full_dataset, train_idx)
-        val_subset = Subset(full_dataset, val_idx)
+        train_subset = Subset(full_dataset, train_chunk_idx)
+        val_subset = Subset(full_dataset, val_chunk_idx)
 
         model = model_fn().to(device)
 
         run = wandb.init(
             project=wandb_project,
-            name=f"fold-{fold_num}-of-{n_folds}",
-            group="cross-validation",
+            name=f"fold-{fold_num}-of-{n_folds}-5sec",
+            group="cross-validation-5sec",
             config={
                 "fold": fold_num,
                 "n_folds": n_folds,
@@ -649,7 +675,7 @@ def train_mert_cross_validation(
                 "architecture": model.__class__.__name__,
                 "base_model": "m-a-p/MERT-v1-330M",
                 "sample_rate": 24000,
-                "chunk_duration": 30,
+                "chunk_duration": 5,
             },
             reinit=True,
         )
@@ -691,8 +717,10 @@ def train_mert_cross_validation(
             "fold": fold_num,
             "best_val_acc": round(best_acc, 4),
             "model_path": save_path,
-            "train_size": len(train_idx),
-            "val_size": len(val_idx),
+            "train_songs": len(train_song_idx),
+            "val_songs": len(val_song_idx),
+            "train_chunks": len(train_chunk_idx),
+            "val_chunks": len(val_chunk_idx),
             "epochs": epochs,
             "time_minutes": round(fold_time / 60, 2),
         }

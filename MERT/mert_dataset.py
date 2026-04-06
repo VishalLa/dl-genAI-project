@@ -12,24 +12,25 @@ from utils import highpass_filter
 
 
 SAMPLE_RATE = 24000
-DURATION = 30
-EXPECTED_LENGTH = int(SAMPLE_RATE * DURATION)
+DURATION = 5
+EXPECTED_LENGTH = int(SAMPLE_RATE * DURATION)  # 120,000 samples
 
 
 class MERTAudioDataset(Dataset):
     """
     Dataset for MERT genre classification.
-    Each song is exactly 30 seconds (no chunking needed).
-    
+    Each song is split into 5-second chunks (MERT's native pre-training context),
+    indexed via a flat index_map — a (song_idx, chunk_start_sample) tuple per chunk.
+
+    A 30-second song produces 6 non-overlapping chunks of 120,000 samples each.
+    The final chunk is zero-padded if the song length is not an exact multiple of 5s.
+
     ESC-50 noise injection during training:
-    - Background noise: 65% probability, SNR 18-35 dB
-    - Foreground events: 35% probability, SNR 2-10 dB
+        Skipped 20% of the time. Otherwise 1-2 noise events are mixed in,
+        each with SNR uniformly sampled from [8, 18] dB.
     """
 
-    ESC50_INJECT_PROB = 0.65
-    ESC50_FG_PROB = 0.35
-    BG_SNR_RANGE = (18, 35)
-    FG_SNR_RANGE = (2, 10)
+
 
     def __init__(self, genre_dir: Path, esc50_dir: Path, train: bool = True):
         """
@@ -44,17 +45,18 @@ class MERTAudioDataset(Dataset):
 
         self.SAMPLE_RATE = SAMPLE_RATE
         self.DURATION = DURATION
-        self.EXPECTED_LENGTH = EXPECTED_LENGTH
+        self.EXPECTED_LENGTH = EXPECTED_LENGTH  # 5s * 24000 = 120,000 samples
 
         self.samples = []
         self.labels = []
         self.class_map = {}
 
         self._load_files()
+        self._build_index_map()
 
         mode = "train" if train else "val"
-        n_songs = len(self.samples)
-        print(f"[{mode}] {n_songs} songs | {len(self.class_map)} classes")
+        n_chunks = len(self.index_map)
+        print(f"[{mode}] {n_chunks} chunks | {len(self.samples)} songs | {len(self.class_map)} classes")
 
 
     def _load_files(self):
@@ -81,19 +83,48 @@ class MERTAudioDataset(Dataset):
         print(f"Classes      : {list(self.class_map.keys())}")
 
 
+    def _build_index_map(self):
+        """
+        Builds self.index_map — a flat list of (song_idx, chunk_start_sample) tuples.
+        Only the first stem of each song is loaded to measure length (avoids
+        loading all stems just to count chunks).
+
+        Note:
+            Songs may be longer or shorter than exactly 30 seconds. The index_map
+            makes __getitem__ O(1) regardless of variable song lengths.
+        """
+        self.index_map = []
+
+        for song_idx in range(len(self.samples)):
+            waveform, sr = torchaudio.load(self.samples[song_idx][0])
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+            if sr != self.SAMPLE_RATE:
+                resampler = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)
+                waveform = resampler(waveform)
+
+            total_len = waveform.shape[1]
+            n_chunks = (total_len + self.EXPECTED_LENGTH - 1) // self.EXPECTED_LENGTH
+
+            for c in range(n_chunks):
+                start = c * self.EXPECTED_LENGTH
+                self.index_map.append((song_idx, start))
+
+        print(f"Total chunks : {len(self.index_map)}")
+
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.index_map)
 
 
     def merge_song(self, wave_list):
         """
         Load all stems, resample, highpass-filter, then mix them by
         stacking + mean (stems are simultaneous, not sequential).
-        
+
         Args:
             wave_list: List of paths to audio stems
-            
+
         Returns:
             torch.Tensor: Mixed waveform of shape [1, samples]
         """
@@ -129,115 +160,108 @@ class MERTAudioDataset(Dataset):
         return torch.stack(padded, dim=0).mean(dim=0)
 
 
-    def ensure_duration(self, waveform: torch.Tensor) -> torch.Tensor:
+    def get_chunk(self, waveform: torch.Tensor, start: int) -> torch.Tensor:
         """
-        Ensure waveform is exactly 30 seconds (720,000 samples at 24kHz).
-        Pad if shorter, trim if longer.
-        
+        Extracts a fixed-length window from a waveform.
+        Zero-pads the last chunk if it is shorter than EXPECTED_LENGTH.
+
         Args:
-            waveform: Input waveform [1, samples]
-            
+            waveform: Full waveform of shape [1, T]
+            start: Start sample index
+
         Returns:
-            torch.Tensor: Waveform of shape [1, 720000]
+            torch.Tensor: Waveform chunk of shape [1, EXPECTED_LENGTH]
         """
-        current_len = waveform.shape[1]
+        end = start + self.EXPECTED_LENGTH
 
-        if current_len < self.EXPECTED_LENGTH:
-            # Pad with zeros
-            padding = self.EXPECTED_LENGTH - current_len
-            waveform = torch.nn.functional.pad(waveform, (0, padding))
-        elif current_len > self.EXPECTED_LENGTH:
-            # Take center crop
-            start = (current_len - self.EXPECTED_LENGTH) // 2
-            waveform = waveform[:, start:start + self.EXPECTED_LENGTH]
+        if waveform.shape[1] < end:
+            padding = end - waveform.shape[1]
+            chunk = torch.nn.functional.pad(waveform[:, start:], (0, padding))
+        else:
+            chunk = waveform[:, start:end]
 
-        return waveform
-    
+        return chunk
 
-    def _load_noise(self, target_len: int) -> torch.Tensor:
-        """
-        Load a random ESC-50 clip, tile if short, crop to target_len.
-        
-        Args:
-            target_len: Desired length in samples
-            
-        Returns:
-            torch.Tensor: Noise waveform [1, target_len]
-        """
-        noise, sr = torchaudio.load(random.choice(self.esc50_paths))
-        noise = noise.mean(dim=0, keepdim=True)
-
-        if sr != self.SAMPLE_RATE:
-            noise = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)(noise)
-
-        if noise.shape[1] < target_len:
-            repeats = (target_len // noise.shape[1]) + 1
-            noise = noise.repeat(1, repeats)
-
-        start = random.randint(0, noise.shape[1] - target_len)
-        return noise[:, start:start + target_len]
 
 
     def inject_esc50_noise(self, music_waveform: torch.Tensor) -> torch.Tensor:
         """
-        Inject ESC-50 noise with two modes per event:
-          BACKGROUND (65%) — SNR 18-35 dB, quiet ambience across full song
-          FOREGROUND (35%) — SNR 2-10 dB, loud event at random onset/duration
-          
+        Randomly mixes ESC-50 environmental noise into a music chunk.
+        Skipped with 20% probability so the model also sees clean examples.
+
+        SNR is sampled from [8, 18] dB per noise event:
+            18 dB → noise is barely audible.
+            8 dB → noise is clearly audible but music still dominates.
+
+        Scaling formula:
+            scale = sqrt(music_power / (noise_power * 10 ^ (SNR_dB / 10)))
+
         Args:
-            music_waveform: Clean music waveform [1, samples]
-            
+            music_waveform (torch.Tensor): Music chunk of shape [1, T].
+
         Returns:
-            torch.Tensor: Music with injected noise [1, samples]
+            torch.Tensor: Waveform with noise mixed in, shape [1, T].
+                          Returned unchanged if augmentation is skipped.
         """
-        if not self.esc50_paths or random.random() > self.ESC50_INJECT_PROB:
+        if not self.esc50_paths or random.random() > 0.8:
             return music_waveform
 
-        song_len = music_waveform.shape[1]
+        samples = music_waveform.shape[1]
+        n_events = random.randint(1, 2)
 
-        # Apply 1-3 noise events
-        for _ in range(random.randint(1, 3)):
-            noise = self._load_noise(song_len)
-            is_foreground = random.random() < self.ESC50_FG_PROB
-            snr_db = random.uniform(
-                *(self.FG_SNR_RANGE if is_foreground else self.BG_SNR_RANGE)
-            )
+        for _ in range(n_events):
+            noise_path = random.choice(self.esc50_paths)
+            noise_wave, sr = torchaudio.load(noise_path)
+            noise_wave = noise_wave.mean(dim=0, keepdim=True)
 
-            # Calculate noise scaling factor
-            music_power = music_waveform.pow(2).mean().clamp(min=1e-9)
-            noise_power = noise.pow(2).mean().clamp(min=1e-9)
-            scale = torch.sqrt(music_power / (noise_power * (10 ** (snr_db / 10))))
+            if sr != self.SAMPLE_RATE:
+                noise_wave = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)(noise_wave)
 
-            if is_foreground:
-                # Foreground: random onset and duration
-                event_len = int(song_len * random.uniform(0.3, 1.0))
-                offset = random.randint(0, song_len - event_len)
-                music_waveform[:, offset:offset + event_len] += scale * noise[:, :event_len]
+            noise_len = noise_wave.shape[1]
+            if noise_len >= samples:
+                noise_wave = noise_wave[:, :samples]
+                start = 0
             else:
-                # Background: full song
-                music_waveform = music_waveform + scale * noise
+                start = random.randint(0, samples - noise_len)
+
+            snr_db = random.uniform(8, 18)
+            music_power = music_waveform.pow(2).mean()
+            noise_power = noise_wave.pow(2).mean() + 1e-9
+
+            scale = torch.sqrt(music_power / (noise_power * (10 ** (snr_db / 10))))
+            music_waveform[:, start:start + noise_len] += scale * noise_wave
 
         return music_waveform
 
 
     def __getitem__(self, index: int):
         """
-        Get a single 30-second song.
-        
+        Returns one augmented waveform chunk and its label.
+
+        Pipeline:
+            1. Look up (song_idx, start) from index_map.
+            2. Merge all stems for the song via merge_song().
+            3. Slice a EXPECTED_LENGTH window via get_chunk().
+            4. Inject ESC-50 noise via inject_esc50_noise() (training only).
+            5. RMS-normalise: waveform / (rms * 3.0).
+            6. Clamp to [-1.0, 1.0] to prevent clipping.
+
         Args:
-            index: Sample index
-            
+            index: Flat index into self.index_map
+
         Returns:
-            waveform: Audio tensor of shape [720000] (30s at 24kHz)
+            waveform: Audio tensor of shape [120000] (5s at 24kHz)
             label: Integer class label
         """
-        label = self.labels[index]
+        song_idx, start = self.index_map[index]
+        wave_list = self.samples[song_idx]
+        label = self.labels[song_idx]
 
         # Merge all stems for this song
-        waveform = self.merge_song(self.samples[index])
+        waveform = self.merge_song(wave_list)
 
-        # Ensure exactly 30 seconds
-        waveform = self.ensure_duration(waveform)
+        # Slice the chunk window (with zero-padding if needed)
+        waveform = self.get_chunk(waveform, start)
 
         # Inject noise during training only
         if self.train:
@@ -264,16 +288,16 @@ def mert_collate_fn(batch):
     """
     Collate function for MERT DataLoader.
     Converts list of (waveform, label) → batched tensors.
-    
+
     Args:
         batch: List of (waveform, label) tuples
-        
+
     Returns:
         input_values: Tensor [batch_size, 720000]
         labels: Tensor [batch_size]
     """
     waveforms, labels = [], []
-    
+
     for waveform, label in batch:
         waveforms.append(waveform.cpu().numpy())
         labels.append(label.item() if isinstance(label, torch.Tensor) else label)

@@ -59,7 +59,7 @@ class MERTPredictionPipeline:
     """
     
     MERT_SAMPLE_RATE = 24000
-    MERT_CHUNK_SIZE = 30
+    MERT_CHUNK_SIZE = 5
     MERT_CHUNK_SAMPLES = int(MERT_SAMPLE_RATE * MERT_CHUNK_SIZE)
 
     def __init__(
