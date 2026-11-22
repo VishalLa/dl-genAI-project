@@ -1,336 +1,209 @@
 from __future__ import annotations
-from typing import Optional, Tuple
 
 import os
 os.environ["TORCHAUDIO_USE_BACKEND_DISPATCHER"] = "0"
-from pathlib import Path
-from torch.utils.data import Dataset
 
-from tqdm import tqdm
-from transformers import ASTFeatureExtractor
-
+import re
 import random
+import warnings
+from pathlib import Path
+
 import torch
 import torchaudio
-import numpy as np
-import soundfile as sf
+from torch.utils.data import Dataset
 
-from scipy.signal import butter, filtfilt
 
-AST_MODEL = "MIT/ast-finetuned-audioset-10-10-0.4593"
-STEM_KEYS = ["bass", "drums", "vocals", "other"]
-
-_feature_extractor: Optional[ASTFeatureExtractor] = None
-
-def get_feature_extractor() -> ASTFeatureExtractor:
-    global _feature_extractor
-    if _feature_extractor is None:
-        _feature_extractor = ASTFeatureExtractor.from_pretrained(AST_MODEL)
-    return _feature_extractor
-    
-
-def highpass_filter(
-    audio: torch.Tensor,
-    cutoff: int = 40,
-    sample_rate: int = 16_000
-) -> torch.Tensor:
+class AST_Dataset(Dataset):
     """
-    Applies a Butterworth high-pass filter to remove very low-frequency noise.
+    Dataset over the precomputed AST spectrograms (.pt files).
+
+    Every .pt file holds (spectrogram, genre_label, stem_id):
+        flattened_* : spectrogram [1024, 128]    -> one stem of one 10.24 s chunk
+        grouped_*   : spectrogram [4, 1024, 128] -> all 4 stems of one chunk
+
+    Train / val split
+        The split is done per SONG (never per chunk), stratified per genre, and is
+        deterministic for a given `seed`. So `AST_Dataset(train=True)` and
+        `AST_Dataset(train=False)` never share a song, even if one of them is built
+        from the clean variant and the other from the augmented one.
+
+        The file names only contain the global item index, not a song id, so the song
+        is reconstructed from it. This relies on `chunks_per_song` (3 for 30 s songs:
+        ceil(30 s / 10.24 s)) and on the order in which precompute wrote the files:
+        song-major, then chunk, then stem. Check the printed songs-per-genre numbers
+        (about 100 per genre for your data).
 
     Args:
-        audio (torch.Tensor): Input waveform tensor of shape [1, samples].
-        cutoff (int): Cutoff frequency in Hz. Default is 40 Hz.
-        sample_rate (int): Sampling rate of the waveform. Default is 16000 Hz.
-
-    Returns:
-        torch.Tensor: Filtered waveform with same shape and dtype as input.
-    """
-    b, a = butter(5, cutoff / (sample_rate / 2), btype='high')
-    
-    audio_np = audio.squeeze(0).cpu().numpy()
-    
-    filtered = filtfilt(b, a, audio_np)
-    filtered = np.ascontiguousarray(filtered)
-    filtered = torch.from_numpy(filtered).unsqueeze(0)
-    
-    return filtered.type_as(audio)
-
-
-class AST_Stem_Dataset(Dataset):
-    
-    """
-    Loads each stem of each song SEPARATELY, mixes ESC-50 noise into each stem
-    independently, and returns 10.24 s chunks ready for ASTFeatureExtractor.
-
-    Expected directory structure:
-        genre_dir/
-            blues/
-                blues.00000/
-                    bass.wav, drums.wav, vocals.wav, others.wav
-                blues.00001/
-                    ...
-
-    Args:
-        genre_dir        : root folder with one sub-folder per genre.
-        esc50_dir        : folder with ESC-50 .wav files.
-        flatten_stems    : True  -> every (song, chunk, stem) is its own item
-                                    returns (wave [T], genre_label, stem_id)
-                           False -> every (song, chunk) is one item holding all 4 stems
-                                    returns (waves [4, T], genre_label, -1)
-        augment          : turn ESC-50 mixing on/off (set False for validation).
-        noise_prob       : probability that a given stem gets noise.
-        snr_range        : (low, high) SNR in dB, sampled per noise event.
-        max_noise_events : each noisy stem gets 1..max_noise_events ESC-50 clips.
+        genre_dir        : root folder that contains the 4 variant folders (GENRES_PT).
+        train            : True -> train songs, False -> validation songs.
+        flatten_stems    : True -> flattened_* variants, False -> grouped_* variants.
+        augment          : True -> *_augmented variants, False -> *_clean variants.
+        val_ratio        : fraction of songs per genre held out for validation.
+        seed             : split seed (use the same value for train and val datasets).
+        chunks_per_song  : number of 10.24 s chunks per song in the precompute step.
+        spec_augment     : SpecAugment-style frequency / time masking, train only.
+        freq_mask        : max number of mel bins masked.
+        time_mask        : max number of frames masked (10 ms per frame).
+        return_stem_id   : flattened only, also return the stem id (0 bass .. 3 other).
     """
     
-    SAMPLE_RATE = 16_000
-    CHUNK_DURATION = 10.24
-    CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION)
-    SILENCE_POWER = 1e-8
+    STEM_KEYS = ["bass", "drums", "vocals", "other"]
+    
+    VARIANTS = {
+        (True, True): "flattened_augmented",
+        (True, False): "flattened_clean",
+        (False, True): "grouped_augmented",
+        (False, False): "grouped_clean",
+    }
+    
+    _NAME_RE = re.compile(r"chunk_(\d+)(?:_c(\d+))?(?:_s(-?\d+))?")
     
     def __init__(
         self,
         genre_dir: Path | str,
-        esc50_dir: Path | str,
+        train: bool = True,
         flatten_stems: bool = True,
         augment: bool = True,
-        noise_prob: float = 0.8,
-        snr_range = (8, 18),
-        max_noise_events: int = 2,
-        highpass_hz: int = 40
+        val_ratio: float = 0.2,
+        seed: int = 42,
+        chunks_per_song: int = 3,
+        spec_augment: bool = False,
+        freq_mask: int = 24,
+        time_mask: int = 96,
+        return_stem_id: bool = False,
     ) -> None:
-        self.genre_dir = genre_dir
-        self.esc50_paths = list(esc50_dir.rglob("*.wav"))
+        
+        self.train = train
         self.flatten_stems = flatten_stems
         self.augment = augment
-        self.noise_prob = noise_prob
-        self.snr_range = snr_range
-        self.max_noise_events = max_noise_events
-        self.highpass_hz = highpass_hz
+        self.val_ratio = val_ratio
+        self.seed = seed
+        self.chunks_per_song = chunks_per_song
+        self.return_stem_id = return_stem_id and flatten_stems
+
+        # select which of the 4 precomputed variants to load
+        self.data_dir = Path(genre_dir) / self.VARIANTS[(flatten_stems, augment)]
+        if not self.data_dir.is_dir():
+            raise FileNotFoundError(f"variant folder not found: {self.data_dir}")
         
-        self.samples = []       # one entry per song: list of 4 stems path (STEM_KEYS order)
-        self.labels = []
-        self.class_map = {}
-        self._resamplers = {}   # cache, one per source smaple rate
+        # optional SpecAugment on the cached spectrograms (train only)
+        self.spec_augment = spec_augment and train
+        if self.spec_augment:
+            self.freq_masking = torchaudio.transforms.FrequencyMasking(freq_mask)
+            self.time_masking = torchaudio.transforms.TimeMasking(time_mask)
+            
+        
+        self.samples = []    # paths of all chunks of the selected split
+        self.labels = []     # genre label per sample
+        self.stem_ids = []   # stem id per sample (-1 for grouped files)
+        self.class_map = {}  # genre name -> label id
+        self.index_map = []  # (song_id, position in self.samples)
         
         self._load_files()
-        self._build_index_map()
         
-    
+        self.idx2genre = {v: k for k, v in self.class_map.items()}
+
+        mode = "train" if train else "val"
+        n_songs = len({s for s, _ in self.index_map})
+        print(f"[{mode}] {len(self.samples)} chunks from {n_songs} songs | "
+              f"{len(self.class_map)} classes | variant: {self.data_dir.name}")
+
+        
     def _load_files(self) -> None:
-        for label_id, genre in enumerate(
-            sorted(p for p in self.genre_dir.iterdir() if p.is_dir())
+        global_song_counter = 0
+        self.song_chunk_counts: dict[int, int] = {}
+        
+        n_stems = len(self.STEM_KEYS) if self.flatten_stems else 1
+        items_per_song = self.chunks_per_song * n_stems
+        
+        for label_id, genre_dir in enumerate(
+            sorted(p for p in self.data_dir.iterdir() if p.is_dir())
         ):
-            self.class_map[genre.name] = label_id
+            genre = genre_dir.name
+            self.class_map[genre] = label_id
             
-            for song_dir in sorted(
-                p for p in genre.iterdir() if p.is_dir()
-            ):
-                wavs = list(song_dir.glob("*.wav"))
-                stem_paths = []
-                for key in STEM_KEYS:
-                    match_ = [w for w in wavs if key in w.stem.lower()]
-                    if len(match_) != 1:
-                        break
-                    stem_paths.append(match_[0])
-                    
-                if len(stem_paths) != len(STEM_KEYS):
+            entries = []
+            for f in genre_dir.glob("*.pt"):
+                m = self._NAME_RE.match(f.stem)
+                if m is None:
                     continue
                 
-                self.samples.append(stem_paths)
-                self.labels.append(label_id)
+                i = int(m.group(1))
+                c = int(m.group(2)) if m.group(2) is not None else 0
+                s = int(m.group(3)) if m.group(3) is not None else -1
+                entries.append((i, c, s, f))
                 
+            if not entries:
+                continue
+            entries.sort()
+            
+            item_ids = sorted({e[0] for e in entries})
+            first=  item_ids[0]
+            if item_ids[-1] - first + 1 != len(item_ids) or len(item_ids) % items_per_song != 0:
+                warnings.warn(
+                    f"[{genre}] {len(item_ids)} items is not a clean multiple of {items_per_song} "
+                    f"(chunks_per_song={self.chunks_per_song}). Song boundaries may be wrong; "
+                    f"check chunks_per_song or store a song id in the precompute step."
+                )
                 
-    def _build_index_map(self) -> None:
-        """
-        Flat list of (song_idx, chunk_start_sample[, stem_idx]).
-        Uses sf.info to read only the file header, so it is fast.
-        """
-        self.index_map = []
-        
-        for song_idx, stem_paths in enumerate(self.samples):
-            info = sf.info(str(stem_paths[0]))
-            total_len = int(round(info.frames * self.SAMPLE_RATE / info.samplerate))
-            n_chunks = max(1, (total_len + self.CHUNK_SAMPLES - 1) // self.CHUNK_SAMPLES)
-        
-            for c in range(n_chunks):
-                start = c * self.CHUNK_SAMPLES
-                if self.flatten_stems:
-                    for stem_idx in range(len(STEM_KEYS)):
-                        self.index_map.append((song_idx, start, stem_idx))
-                else:
-                    self.index_map.append((song_idx, start))
-        
-        print(f"Songs: {len(self.samples)} | items: {len(self.index_map)} "
-              f"({'per-stem' if self.flatten_stems else 'all 4 stems per item'})")
-
+            songs: dict[int, list] = {}
+            for i, c, s, f in entries:
+                songs.setdefault((i - first) // items_per_song, []).append((s, f))
+            song_keys = sorted(songs)
+            
+            # deterministic, stratified split: same songs in val for every dataset instance
+            order = song_keys[:]
+            random.Random(f"{self.seed}-{genre}").shuffle(order)
+            n_val = max(1, round(len(order) * self.val_ratio)) if len(order) > 1 else 0
+            val_songs = set(order[:n_val])
+            
+            for key in song_keys:
+                is_val = key in val_songs 
+                if is_val == self.train:
+                    continue
+                song_id = global_song_counter + key
+                for s, f in songs[key]:
+                    self.samples.append(f)
+                    self.labels.append(label_id)
+                    self.stem_ids.append(s)
+                    self.index_map.append((song_id, len(self.samples) -1))
+                    self.song_chunk_counts[song_id] = self.song_chunk_counts.get(song_id, 0) + 1
+                    
+            global_song_counter += max(song_keys) + 1
+            print(f"  {genre:10s} songs: {len(song_keys):3d} | val: {n_val:3d}")
+            
+    
+    @property
+    def song_ids(self) -> list[int]:
+        return [s for s, _ in self.index_map]
+    
+    
+    def _mask(self, spec: torch.Tensor) -> torch.Tensor:
+        x = spec.transpose(0, 1)
+        x = self.freq_masking(x)
+        x = self.time_masking(x)
+        return x.transpose(0, 1).contiguous()
+    
+    
+    def _apply_spec_augment(self, spec: torch.Tensor) -> torch.Tensor:
+        if spec.dim() == 2:
+            return self._mask(spec)
+        return torch.stack([self._mask(s) for s in spec])
+    
     
     def __len__(self) -> int:
-        return len(self.index_map)
+        return len(self.samples)
     
     
-    def _to_mono_16k(self, path: Path | str) -> torch.Tensor:
-        waveform, sr = torchaudio.load(path)
-        waveform = waveform.mean(dim=0, keepdim=True)
-        if sr != self.SAMPLE_RATE:
-            if sr not in self._resamplers:
-                self._resamplers[sr] = torchaudio.transforms.Resample(sr, self.SAMPLE_RATE)
-            waveform = self._resamplers[sr](waveform)
-        return waveform
-    
-    def _load_stem(self, path: Path | str) -> torch.Tensor:
-        waveform = self._to_mono_16k(path=path)
-        return highpass_filter(waveform, cutoff=self.highpass_hz, sample_rate=self.SAMPLE_RATE)
-    
-    
-    def _get_chunk(self, waveform: torch.Tensor, start: int) -> torch.Tensor:
-        end = start + self.CHUNK_SAMPLES
-        if waveform.shape[1] < end:
-            return torch.nn.functional.pad(waveform[:, start:], (0, end - waveform.shape[1]))
-        return waveform[:, start:end]
-    
-    
-    def _normalise(self, chunk: torch.Tensor) -> torch.Tensor:
-        power = chunk.pow(2).mean()
-        if power < self.SILENCE_POWER:
-            return chunk
-        rms = torch.sqrt(power + 1e-9)
-        return (chunk / (rms * 3.0)).clamp(-1.0, 1.0)
-    
-    
-    def _inject_esc50_noise(self, stem_chunk: torch.Tensor) -> torch.Tensor:
-        if not self.augment or random.random() > self.noise_prob:
-            return stem_chunk
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        spec, _, _ = torch.load(self.samples[idx], map_location="cpu")
+        spec = spec.float()
         
-        stem_power = stem_chunk.pow(2).mean()
-        if stem_power < self.SILENCE_POWER:
-            return stem_chunk
-        
-        out = stem_chunk.clone()
-        n_sample = out.shape[1]
-        
-        for _ in range(random.randint(1, self.max_noise_events)):
-            noise = self._to_mono_16k(random.choice(self.esc50_paths))
-            noise_len = noise.shape[1]
+        if self.spec_augment:
+            spec = self._apply_spec_augment(spec)
             
-            if noise_len >= n_sample:
-                crop = random.randint(0, noise_len - n_sample)
-                noise = noise[:, crop:crop + n_sample]
-                place = 0
-            else:
-                place = random.randint(0, n_sample - noise_len)
-                
-            active = noise[noise.abs() > 1e-4]
-            if active.numel() == 0:
-                continue
-            noise_power = active.pow(2).mean() + 1e-9
-            
-            snr_db = random.uniform(*self.snr_range)
-            scale = torch.sqrt(stem_power / (self.noise_prob * 10 ** (snr_db / 10)))
-            out[:, place:place + noise.shape[1]] += scale * noise
-    
-        return out
-    
-    
-    def _process_stem(self, path: Path | str, start: int) -> torch.Tensor:
-        wave = self._load_stem(path=path)
-        chunk = self._get_chunk(wave, start)
-        chunk = self._inject_esc50_noise(chunk)
-        chunk = self._normalise(chunk)
-        return chunk.squeeze(0)
-
-    
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.flatten_stems:
-            song_idx, start, stem_idx = self.index_map[index]
-            label = self.labels[song_idx]
-            wave = self._process_stem(self.samples[song_idx][stem_idx], start)
-            return wave, torch.tensor(label, dtype=torch.long), torch.tensor(stem_idx, dtype=torch.long)
-
-        song_idx, start = self.index_map[index]
-        label = self.labels[song_idx]
-        waves = torch.stack([self._process_stem(p, start) for p in self.samples[song_idx]])
-        return waves, torch.tensor(label, dtype=torch.long), torch.tensor(-1, dtype=torch.long)
-    
-
-def collate_fn(batch):
-    """
-    flatten_stems=True  -> input_values [B, 1024, 128], labels [B], stem_ids [B]
-    flatten_stems=False -> input_values [B, 4, 1024, 128], labels [B], stem_ids [B] (all -1)
-    """
-    waves, labels, stem_ids = zip(*batch)
-    extractor = get_feature_extractor()
-    stacked = waves[0].dim() == 2
-
-    if stacked:
-        flat = [w.numpy() for item in waves for w in item]   # B*4 waveforms
-    else:
-        flat = [w.numpy() for w in waves]
-
-    feats = extractor(flat, sampling_rate=16000, padding="max_length", return_tensors="pt").input_values
-
-    if stacked:
-        feats = feats.view(len(waves), len(STEM_KEYS), *feats.shape[1:])
-
-    return feats, torch.stack(labels), torch.stack(stem_ids)
-
-
-def precompute_stem_dataset(
-    genre_dir: Path | str, 
-    esc50_dir: Path | str, 
-    output_dir: Path | str, 
-    flatten_stems: bool,
-    augment: bool = True, 
-    copies: int = 1, 
-    dtype=torch.float16
-) -> None:
-    dataset = AST_Stem_Dataset(
-        genre_dir=genre_dir, 
-        esc50_dir=esc50_dir, 
-        flatten_stems=flatten_stems, 
-        augment=augment
-    )
-    extractor = get_feature_extractor()
-    output_dir = Path(output_dir)
-    
-    id2genre = {v: k for k, v in dataset.class_map.items()}
-    for genre in dataset.class_map:
-        (output_dir / genre).mkdir(parents=True, exist_ok=True)
-
-    for c in range(copies):
-        for i in tqdm(range(len(dataset)), desc=f"copy {c + 1}/{copies}"):
-            wave, label, stem_id = dataset[i]
-            spec = extractor(
-                wave.numpy(), sampling_rate=16000, padding="max_length", return_tensors="pt"
-            ).input_values.squeeze(0).to(dtype)
-
-            save_path = output_dir / id2genre[label.item()] / f"chunk_{i}_c{c}_s{stem_id.item()}.pt"
-            torch.save((spec, label, stem_id), save_path)
-
-    print(f"Done. Saved to {output_dir.absolute()}")
-    
-if __name__ == "__main__":
-    import sys
-
-    project_root = str(Path(__file__).resolve().parents[1])
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-
-    from helper.golbal_variables import GENRES_STEMS, ESC_50_MASTER, GENRES_PT
-
-    dataset_variants = (
-        ("flattened_augmented", True, True),
-        ("flattened_clean", True, False),
-        ("grouped_augmented", False, True),
-        ("grouped_clean", False, False),
-    )
-
-    for variant, flatten_stems, augment in dataset_variants:
-        print(f"data variation: {variant}")
-        precompute_stem_dataset(
-            genre_dir=GENRES_STEMS,
-            esc50_dir=ESC_50_MASTER,
-            output_dir=GENRES_PT / variant,
-            flatten_stems=flatten_stems,
-            augment=augment,
-        )
+        label = torch.as_tensor(self.labels[idx], dtype=torch.long)
+        
+        if self.return_stem_id:
+            return spec, label, torch.as_tensor(self.stem_ids[idx], dtype=torch.long)
+        return spec, label
